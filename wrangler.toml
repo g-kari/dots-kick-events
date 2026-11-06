@@ -1,0 +1,28 @@
+# dots-kick-events — reference configuration.
+# NOTE: the live deployment was performed through the Cloudflare API
+# (custom.cloudflare connector `execute`), not with wrangler. This file
+# mirrors the deployed configuration for reference / future redeploys.
+name = "dots-kick-events"
+main = "worker.js"
+compatibility_date = "2025-11-01"
+
+[[durable_objects.bindings]]
+name = "STORE"
+class_name = "Store"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Store"]
+
+# Secrets (set via API / dashboard — never write values in this file):
+#   TRIGGER_KEY   admin key for POST /trigger
+#                 (also stored in
+#                  ~/workspace/goals/reason-network/hidden_files/dots-events-trigger-key.txt)
+#
+# Test-only plain vars (NOT set in production):
+#   TEST_ECHO=1 and TEST_ECHO_SECRET=<throwaway whsec_> enable POST /test-echo
+#   (signature-checking echo used for self-verification; see README).
+#
+# Endpoints:
+#   https://dots-events.0g0.xyz/mcp      (Workers Custom Domain, production)
+#   https://dots-kick-events.0g0.workers.dev/mcp  (workers.dev, also enabled)
