@@ -157,6 +157,10 @@ const TOOLS = [
 
 // ---------- Durable Object storage ----------
 
+// Request lifecycle ranks. Status merges only ever move a record
+// forward along this ladder; nothing writes a status backwards.
+const STATUS_RANK = { pending: 0, delivered: 1, acknowledged: 2, completed: 3 };
+
 export class Store extends DurableObject {
   async fetch(request) {
     const url = new URL(request.url);
@@ -234,12 +238,45 @@ export class Store extends DurableObject {
           ...existing,
           ...(Array.isArray(deliveries) ? deliveries : []),
         ];
-        const rank = { pending: 0, delivered: 1, acknowledged: 2, completed: 3 };
         const computed = anyOk ? "delivered" : "pending";
-        if ((rank[record.status] ?? 0) < (rank[computed] ?? 0)) {
+        if ((STATUS_RANK[record.status] ?? 0) < (STATUS_RANK[computed] ?? 0)) {
           record.status = computed;
         }
         record.updatedAt = new Date().toISOString();
+        await s.put(key, JSON.stringify(record));
+        merged = record;
+      });
+      return merged === null
+        ? new Response(null, { status: 404 })
+        : Response.json(merged);
+    }
+    if (url.pathname === "/merge-status") {
+      // Merge a status update (update_request_status) into the CURRENT
+      // record, atomically. The tool handler used to read the record in
+      // the Worker, edit the snapshot, and write it back wholesale —
+      // a read-modify-write outside this object's serialization, so a
+      // delivery merge landing between the read and the write was
+      // silently overwritten (delivery results lost), and two racing
+      // updates overwrote each other's notes. Here the update is a
+      // field-level merge against the latest record instead: the
+      // status only advances along STATUS_RANK (an "acknowledged"
+      // arriving after "completed" cannot regress it) and a note, when
+      // present, is appended to the current notes array.
+      const { key, status, note } = await request.json();
+      let merged = null;
+      await this.ctx.blockConcurrencyWhile(async () => {
+        const raw = await s.get(key);
+        if (raw === undefined) return;
+        const record = JSON.parse(raw);
+        const nowIso = new Date().toISOString();
+        if ((STATUS_RANK[status] ?? -1) > (STATUS_RANK[record.status] ?? 0)) {
+          record.status = status;
+        }
+        if (typeof note === "string" && note) {
+          record.notes = Array.isArray(record.notes) ? record.notes : [];
+          record.notes.push({ status, note, at: nowIso });
+        }
+        record.updatedAt = nowIso;
         await s.put(key, JSON.stringify(record));
         merged = record;
       });
@@ -305,6 +342,17 @@ function store(env) {
       const r = await stub.fetch("https://store/merge-delivery", {
         method: "POST",
         body: JSON.stringify({ key, deliveries, anyOk }),
+      });
+      if (r.status === 404) return null;
+      return r.json();
+    },
+    // Atomically merge a status update into the current stored record
+    // (see the Store "/merge-status" endpoint); returns the merged
+    // record, or null if the key does not exist.
+    async mergeStatus(key, status, note) {
+      const r = await stub.fetch("https://store/merge-status", {
+        method: "POST",
+        body: JSON.stringify({ key, status, note: note ?? null }),
       });
       if (r.status === 404) return null;
       return r.json();
@@ -1058,18 +1106,17 @@ async function handleToolsCall(db, id, params) {
         toolText({ error: "status must be acknowledged or completed" }, true)
       );
     }
-    const raw = await db.get("req:" + requestId);
-    if (!raw) {
+    // The update is applied as a serialized field-level merge inside
+    // the Durable Object (see "/merge-status"), never as a wholesale
+    // write of a snapshot read here: a delivery merge landing while
+    // this call is in flight must not be overwritten, and two racing
+    // updates must not lose each other's notes.
+    const note =
+      typeof args.note === "string" && args.note ? args.note : null;
+    const record = await db.mergeStatus("req:" + requestId, status, note);
+    if (!record) {
       return rpcResult(id, toolText({ error: "request not found" }, true));
     }
-    const record = JSON.parse(raw);
-    record.status = status;
-    record.updatedAt = new Date().toISOString();
-    if (typeof args.note === "string" && args.note) {
-      record.notes = record.notes || [];
-      record.notes.push({ status, note: args.note, at: record.updatedAt });
-    }
-    await db.put("req:" + requestId, JSON.stringify(record));
     return rpcResult(id, toolText(record));
   }
   return rpcError(id, -32602, `Unknown tool: ${String(name)}`);
@@ -1292,24 +1339,25 @@ async function handleTrigger(env, db, request) {
   };
   if (topic) record.topic = topic;
 
-  if (suppliedId) {
-    const { created, value } = await db.create(
-      "req:" + suppliedId,
-      JSON.stringify(record)
-    );
-    if (!created) {
-      const existing = JSON.parse(value);
-      const deliveries = Array.isArray(existing.deliveries) ? existing.deliveries : [];
-      return jsonResponse({
-        request_id: existing.id,
-        status: existing.status,
-        deduplicated: true,
-        subscriptions_matched: deliveries.length,
-        delivered: deliveries.filter((r) => r.ok).length,
-      });
-    }
-  } else {
-    await db.put("req:" + record.id, JSON.stringify(record));
+  // Creation always goes through the atomic put-if-absent, for
+  // server-generated IDs too: every write to a request record is then
+  // one of the Durable Object's serialized operations (create,
+  // merge-delivery, merge-status), and no path writes back a snapshot
+  // read in the Worker.
+  const { created, value } = await db.create(
+    "req:" + record.id,
+    JSON.stringify(record)
+  );
+  if (!created) {
+    const existing = JSON.parse(value);
+    const deliveries = Array.isArray(existing.deliveries) ? existing.deliveries : [];
+    return jsonResponse({
+      request_id: existing.id,
+      status: existing.status,
+      deduplicated: true,
+      subscriptions_matched: deliveries.length,
+      delivered: deliveries.filter((r) => r.ok).length,
+    });
   }
 
   const results = await deliverToSubscriptions(db, record, env);

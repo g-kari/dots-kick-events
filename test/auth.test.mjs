@@ -773,3 +773,115 @@ test("a status update landing during delivery is not rolled back by the delivery
     token
   );
 });
+
+// ---------------- delivery/status races, both directions (re-review) ----
+// The test above covers one direction: an update that fully lands while
+// a delivery is in flight must survive the delivery merge. The mirror
+// image was still open after that fix: update_request_status used to
+// read a snapshot in the Worker and write it back wholesale, so an
+// update whose write landed AFTER the delivery merge silently erased
+// the merged delivery result, and two racing updates erased each
+// other's notes. All request mutations are now serialized field-level
+// merges inside the Durable Object; this test races updates against a
+// delivery at several points of its flight — including two updates at
+// once, and one fired just as the held response returns — and asserts
+// that the delivery result, the status, and every note survive.
+
+test("status/note updates racing an in-flight delivery — and each other — lose nothing in either direction", async () => {
+  const token = mintJwt(key1);
+  const sub = await rpc(
+    {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "events/subscribe",
+      params: { name: "kick", arguments: {}, delivery: { mode: "webhook", url: RECEIVER_SLOW, secret: WHSEC } },
+    },
+    token
+  );
+  assert.equal(sub.status, 200, JSON.stringify(sub.json));
+
+  const firedPromise = trigger({ text: "両方向の競合", request_id: "req-race-2" });
+  // Wait until the delivery request has reached the receiver; the stub
+  // holds its response back (~800ms), so the delivery is in flight and
+  // its merge into the record is still to come.
+  for (let i = 0; i < 200; i++) {
+    if (deliveries.some((d) => d.body?.data?.request_id === "req-race-2")) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.ok(deliveries.some((d) => d.body?.data?.request_id === "req-race-2"));
+
+  const update = (note) =>
+    rpc(
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "update_request_status",
+          arguments: { request_id: "req-race-2", status: "acknowledged", note },
+        },
+      },
+      token
+    );
+
+  // (a) immediately, (b) a burst of six at once midway — racing each
+  // other over the notes array (with the old snapshot write-back this
+  // burst demonstrably lost notes) — and (c) just before the held
+  // response returns, so the last update's merge races the delivery
+  // merge head-on. Whichever side of the delivery merge each update
+  // lands on, the outcome must be the same: nothing is lost in either
+  // direction.
+  const burstNotes = ["同時メモ1", "同時メモ2", "同時メモ3", "同時メモ4", "同時メモ5", "同時メモ6"];
+  const p1 = update("即時メモ");
+  await new Promise((r) => setTimeout(r, 300));
+  const burst = burstNotes.map((n) => update(n));
+  await new Promise((r) => setTimeout(r, 450));
+  const p4 = update("間際メモ");
+  const updates = await Promise.all([p1, ...burst, p4]);
+  for (const u of updates) {
+    assert.equal(
+      JSON.parse(u.json.result.content[0].text).status,
+      "acknowledged"
+    );
+  }
+
+  const fired = await firedPromise;
+  assert.equal(fired.status, 200);
+  assert.equal(fired.json.delivered, 1);
+
+  const list = await rpc(
+    { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_pending_requests", arguments: {} } },
+    token
+  );
+  const found = JSON.parse(list.json.result.content[0].text).requests.find(
+    (r) => r.id === "req-race-2"
+  );
+  assert.equal(found.status, "acknowledged"); // advanced, never rolled back
+  assert.equal(found.deliveries.length, 1); // delivery result not overwritten
+  assert.equal(found.deliveries[0].ok, true);
+  const notes = (found.notes || []).map((n) => n.note);
+  for (const expected of ["即時メモ", ...burstNotes, "間際メモ"]) {
+    assert.ok(notes.includes(expected), `lost note ${expected}: ${JSON.stringify(notes)}`);
+  }
+
+  // cleanup
+  await rpc(
+    {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "update_request_status", arguments: { request_id: "req-race-2", status: "completed" } },
+    },
+    token
+  );
+  await rpc(
+    {
+      jsonrpc: "2.0",
+      id: 5,
+      method: "events/unsubscribe",
+      params: { name: "kick", arguments: {}, delivery: { mode: "webhook", url: RECEIVER_SLOW } },
+    },
+    token
+  );
+});
+
