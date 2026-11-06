@@ -60,29 +60,36 @@ MCP エンドポイント `POST /mcp`（JSON-RPC 2.0）:
 
 `pending`（保存済み・未配送または配送失敗）→ `delivered`（Webhook が 2xx で受領）→ `acknowledged`（dots が受領を申告）→ `completed`（dots が完了を申告）。配送結果（購読ごと・試行回数・HTTP状態）は依頼レコードに残るので、未完了分は `list_pending_requests` で後から照合できる。
 
-## 認証（OAuth 2.1）
+## 認証（OAuth 2.1）— 0g0-id を認可サーバーにする構成
 
-MCP 認可仕様（OAuth 2.1 ベース）に準拠し、`/mcp` は保護リソースとして認証必須にした。認可サーバーは同一 Worker・同一オリジンに置く最小構成で、外部 IdP の新規契約や追加の認証情報は使わない。
+`/mcp` は保護リソースとして認証必須。**認可サーバーは所有者自身の IdP「0g0-id」（https://id.0g0.xyz）に分離し、本 Worker はトークンを発行しないリソースサーバー専用**にした。
 
-### 方式の選択理由
+### 方式の経緯
 
-- 前提: このサーバーのリソース所有者は1人（所有者本人）で、利用クライアントは ChatGPT（dots）だけ。複数ユーザーや組織向けの汎用 IdP は過剰。
-- 外部 IdP（Auth0 / Clerk / Cloudflare Access 等）: テナント作成と認証情報の発行・設定が別途必要で、本変更の範囲外。将来ユーザー数が増えたら、保護リソース側（この Worker のトークン検証）はそのままに、認可サーバーだけ外部 IdP へ差し替え可能（メタデータの `authorization_servers` を変えるだけ）。
-- GitHub OAuth 等の素の OAuth 2.0: RFC 8414 メタデータ、DCR、`resource` パラメータによる audience 束縛を満たさず、MCP クライアントのディスカバリと噛み合わない。
-- 同一オリジン内蔵の認可サーバー: MCP 仕様自体が「認可サーバーはリソースサーバーと同一主体でホストしてよい」と認める構成。実装は標準部品のみ（後述）に絞り、独自暗号や独自フローは作っていない。
+- 初版の PR では「同一 Worker 内に最小構成の認可サーバーを内蔵」する方式だったが、所有者の判断で 0g0-id 方式に作り替えた。既存の信頼できる IdP があるのに自作の認証基盤（パスワードログイン・セッション・トークン保管）を増やすべきではない、というのが理由。
+- 0g0-id 側に不足していた2点は 0g0-id の PR で追加した: **RFC 7591 動的クライアント登録（DCR）** と **RFC 8707 リソースインジケーターによる audience 束縛**（従来の 0g0-id はアクセストークンの `aud` が常に `client_id` で、リソースサーバーに束縛できなかった）。→ https://github.com/g-kari/0g0-id/pull/336
 
-### 実装した要素
+### 前提・依存関係（これが揃うまで本方式では動かない）
+
+1. 0g0-id 側 PR のマージとデプロイ、本番 D1 へのマイグレーション適用。
+2. 0g0-id のリソースサーバーレジストリへの本サーバーの登録: URI `https://dots-events.0g0.xyz/mcp`、許可スコープ `events:read events:subscribe requests:read requests:update`（管理 API `POST /api/resources`）。
+3. 本 PR のデプロイ。
+
+audience 検証はこの登録 URI との完全一致で行うため、登録が無い／URI がずれていれば、正規のトークンでも全て 401 になる（安全側）。
+
+### トークン検証（リクエストごと）
+
+| 項目 | 内容 |
+|---|---|
+| 形式 | 0g0-id が発行する **ES256 JWT のみ**。不透明（opaque）トークンは受理しない |
+| 鍵の取得 | JWKS `https://id.0g0.xyz/.well-known/jwks.json` から `kid` で選択。10分キャッシュし、未知の `kid` では再取得して鍵ローテーションに追従（再取得は1秒に1回まで） |
+| 検証内容 | 署名（ES256）、`iss` = `https://id.0g0.xyz`、`aud` = 本サーバーの resource URI、`exp` / `nbf`、`sub` の存在、スコープ（`scope` 文字列／`scp` 配列） |
+| principal | トークンの `sub`。購読の所有者はこれに結び付く |
 
 | 要素 | 内容 |
 |---|---|
-| 保護リソースメタデータ (RFC 9728) | `GET /.well-known/oauth-protected-resource` と `/.well-known/oauth-protected-resource/mcp`。`resource` は MCP エンドポイント URL、`authorization_servers` は自オリジン |
-| 認可サーバーメタデータ (RFC 8414) | `GET /.well-known/oauth-authorization-server`（`/.well-known/openid-configuration` でも同じ文書を返す）。`code_challenge_methods_supported: ["S256"]`、`authorization_response_iss_parameter_supported: true` を広告 |
-| 動的クライアント登録 (RFC 7591) | `POST /oauth/register`。公開クライアント（`token_endpoint_auth_method: "none"`）のみ。redirect URI は https 必須（localhost の http のみ開発用に許可） |
-| 認可フロー | Authorization Code + PKCE（S256 必須、plain は拒否）。所有者がパスワードでログインし、同意画面でクライアント名・スコープ・戻り先を確認して許可する。認可応答には RFC 9207 の `iss` を常に付ける（成功・エラーとも） |
-| トークン発行 | `POST /oauth/token`。認可コードは単一使用（原子的に取得・削除されるため、PKCE 検証に失敗した交換でも消費される）・有効期限10分。アクセストークン1時間、リフレッシュトークン30日（ローテーション式: 使用時に旧トークンを無効化し再利用を検出） |
-| 失効 (RFC 7009) | `POST /oauth/revoke`。アクセストークン／リフレッシュトークンを個別に失効できる |
-| トークン形式 | 不透明（opaque）トークン。保存時は SHA-256 ハッシュをキーにするため、ストレージ漏洩がそのまま資格情報漏洩にならない。検証はリクエストごとに issuer・audience（= このサーバーの resource）・有効期限・種別（access / refresh の混用防止）を確認 |
-| 所有者ログイン | パスワードの SHA-256 ハッシュを Worker シークレット `OWNER_PASSWORD_HASH` に保持し、定数時間比較で照合。ログインセッションは `AUTH_SECRET` で HMAC 署名した Cookie（HttpOnly / Secure / SameSite=Lax、30分） |
+| 保護リソースメタデータ (RFC 9728) | `GET /.well-known/oauth-protected-resource`（`/mcp` サフィックス付きでも可）。`resource` は MCP エンドポイント URL、`authorization_servers` は `["https://id.0g0.xyz"]` |
+| 認可サーバーメタデータ | 本 Worker では提供しない（404）。0g0-id の `https://id.0g0.xyz/.well-known/oauth-authorization-server` を参照 |
 
 ### スコープと認可
 
@@ -94,12 +101,17 @@ MCP 認可仕様（OAuth 2.1 ベース）に準拠し、`/mcp` は保護リソ�
 | `requests:update` | `update_request_status` |
 
 - トークンがない・不正・期限切れの `/mcp` 呼び出しは **401** と `WWW-Authenticate: Bearer resource_metadata="…"、scope="…"` を返す。スコープ不足は **403**（単一リクエスト時）と step-up 用の `WWW-Authenticate` を返す（バッチ内では該当メッセージだけ JSON-RPC エラー `-32003`）。
-- 購読はトークンの principal に結び付く。別 principal が同じ（URL・名前・引数）で解除しようとしても、購読ID自体が異なるため所有者の購読には届かない（レコード側でも principal 一致を確認する二重防御）。配送対象は認証済み principal の購読のみで、認証導入前の `anonymous` 購読（自己検証用データ）には配送しない。
-- クライアント登録自体は誰でも可能だが、トークンは「所有者のログイン＋同意」を経ないと発行されないため、登録だけで権限は得られない。
+- 購読はトークンの `sub` に結び付く。別 principal が同じ（URL・名前・引数）で解除しようとしても、購読ID自体が異なるため所有者の購読には届かない（レコード側でも principal 一致を確認する二重防御）。配送対象は認証済み principal の購読のみで、認証導入前の `anonymous` 購読（自己検証用データ）には配送しない。
+
+### クライアント登録（ChatGPT 側の接続に必要）
+
+- **DCR（動的登録）**: 0g0-id の `POST /api/register`（RFC 7591）。ChatGPT のような MCP クライアントが公開クライアント（`token_endpoint_auth_method: "none"` ＋ PKCE S256）として自己登録できる。redirect URI は https 必須（localhost の http は開発用に許可）。初期アクセストークンは不要。
+- **管理登録**: 0g0-id の管理 API／管理画面から通常のクライアント（サービス）として事前登録してもよい。
+- どちらの経路でも、認可の関門は「0g0-id のログイン画面で所有者本人がサインインすること」。登録できただけではトークンは発行されない。
 
 ### 発火 API（/trigger）の認証は OAuth とは別
 
-- `/trigger` は従来どおり管理キー（`TRIGGER_KEY`）でのみ認証する機械間 API で、OAuth フローには組み込まない。送信者の本人性は「キー所持」によってのみ担保され、payload 内のフィールドでは決めない。実際、読み取るフィールドは `text`、`topic`、`request_id` のホワイトリストのみで、`status` や `callback_url`、`deliver_to` のような追加フィールドは無視される（テストで担保）。
+- `/trigger` は従来どおり管理キー（`TRIGGER_KEY`）でのみ認証する機械間 API で、OAuth フローには組み込まない。送信者の本人性は「キー所持」によってのみ担保され、payload 内のフィールドでは決めない。実際、読み取るフィールドは `text`、`topic`、`request_id` のホワイトリストのみで、`status` や `callback_url`、`deliver_to` のような追加フィールドは無視される（テストで担保）。IdP のアクセストークンを /trigger のキー代わりに使うこともできない（テストで担保）。
 - Webhook の `whsec_` 署名は「この配送が本サーバーから来たこと」の検証であり、元の依頼者の本人確認とは別のもの。この区別はコードコメントにも明記した。
 - 届いた `text` は外部入力（信頼できないデータ）として扱う。payload には受信側の権限や安全制約を変えるフィールドを一切含めない（スキーマは従来どおり `request_id` / `text` / `topic` / `created_at` のみ）。
 
@@ -113,23 +125,24 @@ MCP 認可仕様（OAuth 2.1 ベース）に準拠し、`/mcp` は保護リソ�
 | 名前 | 種別 | 用途 |
 |---|---|---|
 | `TRIGGER_KEY` | シークレット（設定済み） | `POST /trigger` の管理キー |
-| `OWNER_PASSWORD_HASH` | シークレット（要設定） | 所有者ログイン用パスワードの SHA-256 ハッシュ（16進小文字）。例: `printf %s '決めたパスワード' \| sha256sum` で計算して設定する |
-| `AUTH_SECRET` | シークレット（要設定） | セッション Cookie の HMAC 鍵。例: `openssl rand -hex 32` で生成して設定する |
+| `IDP_ISSUER` | 平文変数（任意） | 認可サーバーの issuer。既定 `https://id.0g0.xyz` |
+| `JWKS_URI` | 平文変数（任意） | JWKS の取得先。既定 `<IDP_ISSUER>/.well-known/jwks.json` |
+| `RESOURCE_URI` | 平文変数（任意） | audience の期待値。既定は自オリジン + `/mcp`。0g0-id 側の登録 URI と一致させること |
 | `TEST_ECHO` / `TEST_ECHO_SECRET` | 平文変数（テスト専用、本番では設定しない） | 署名検証エコー `POST /test-echo` の有効化と使い捨て秘密 |
 
-`OWNER_PASSWORD_HASH` と `AUTH_SECRET` が未設定の間、`/oauth/*` は 503 を返し、`/mcp` は認証を通過できない（安全側に倒れる）。デプロイと同時に両シークレットを設定すること。
+内蔵認可サーバー方式で使っていた `OWNER_PASSWORD_HASH` / `AUTH_SECRET` は廃止した（本 Worker はログインもセッションもトークン発行もしない）。
 
 ### 運用・失効手順
 
-- 個別トークンの失効: `POST /oauth/revoke` に `token` と `client_id` を送る。
-- クライアントの締め出し: ストレージの `client:<client_id>` レコードを削除すると、その client_id では新規認可ができなくなる（既存トークンは期限切れか個別失効まで有効）。
-- 所有者パスワードの変更: `OWNER_PASSWORD_HASH` を新しいハッシュに差し替える。既存セッションも止めたい場合は `AUTH_SECRET` も差し替える（セッション全失効。発行済みトークンには影響しない）。
-- 全トークンの一括失効: ストレージの `token:` プレフィックスのレコードを全削除する。
+- 個別トークンの失効: アクセストークンは 0g0-id の発行ポリシーで短命（15分）。リフレッシュトークンの失効は 0g0-id の `POST /api/token/revoke` で行う。
+- クライアントの締め出し: 0g0-id 側で該当クライアント（サービス）を削除する。以後の認可・更新ができなくなる。
+- 購読の締め出し: 購読は principal（`sub`）単位で保存されているため、対象ユーザーの購読レコードをストレージから削除すれば配送が止まる。
+- 鍵ローテーション: 0g0-id 側で署名鍵を差し替えても、JWKS の再取得で自動追従する（未知 `kid` 検出時）。
 
 ### 検証方法
 
-- 自動テスト（ローカル、合成データのみ、本番に触れない）: `npm install` のあと `npm test`。Miniflare 上で実 Worker を起動し、メタデータ検証、無認証 401、認可フロー（誤パスワード拒否・PKCE・コード単一使用）、期限切れ／誤 audience／誤 issuer／refresh 混用の拒否、スコープ不足 403、別 principal による解除の無効化、未認証発火 401、`request_id` 重複（順次・同時）の単一配送、payload による状態・配送先の上書き不可、改ざん Webhook の拒否、リフレッシュローテーションと失効、kick スキーマ互換までを確認する。
-- デプロイ後の目視確認: メタデータ2種が 200 で返ること、無認証の `initialize` が 401 + `WWW-Authenticate` になること、ChatGPT の接続で OAuth フロー（ログイン→同意）が始まること。
+- 自動テスト（ローカル、合成データのみ、本番に触れない）: `npm install` のあと `npm test`（`test/auth.test.mjs`、16件）。Miniflare 上で実 Worker を起動し、合成 ES256 鍵ペアで署名した 0g0-id 形式 JWT とモック JWKS（outboundService で配信）を使い、メタデータ（`authorization_servers` が 0g0-id を指すこと、内蔵 AS のエンドポイントが 404 であること）、無認証 401、不透明トークンの拒否、有効トークンでの接続→購読→署名付き配送→状態照合→解除の通し、署名不正・ペイロード改ざん・期限切れ・誤 `iss`・誤 `aud` の拒否、スコープ不足 403、別 principal による解除の無効化、未認証発火（IdP トークン流用含む）の拒否、`request_id` 重複の単一配送、payload による状態上書きの不可、鍵ローテーションへの追従、改ざん Webhook の拒否、kick スキーマ互換を確認する。
+- デプロイ後の実機確認: 保護リソースメタデータが 200 で `authorization_servers` に 0g0-id が入ること、無認証の `initialize` が 401 + `WWW-Authenticate` になること、ChatGPT の接続で 0g0-id のログイン画面に遷移し、認可後に `kick` の購読が作れること。
 
 ## 発火方法（管理用）
 
@@ -149,9 +162,9 @@ curl -X POST https://dots-events.0g0.xyz/trigger \
 
 ## dots 側の接続手順（未実施・dots 側の操作待ち）
 
-ガイドの手順に沿って dots／ユーザーが実施する:
+前提として「認証（OAuth 2.1）＞前提・依存関係」の 0g0-id 側の準備（PR マージ・デプロイ・リソース登録）が完了していること。ガイドの手順に沿って dots／ユーザーが実施する:
 
-1. プラグインとしてこの MCP サーバー（`https://dots-events.0g0.xyz/mcp`）を接続する。認証が必要なサーバーとして認識されると OAuth フローが始まるので、所有者パスワードでログインし、同意画面で許可する（事前に `OWNER_PASSWORD_HASH` と `AUTH_SECRET` の設定と、本変更のデプロイが必要）。
+1. プラグインとしてこの MCP サーバー（`https://dots-events.0g0.xyz/mcp`）を接続する。認証が必要なサーバーとして認識されると、0g0-id のログイン画面へ遷移するので、所有者アカウントでサインインして認可する（クライアント登録は DCR で自動に行われる想定。うまくいかない場合は 0g0-id の管理画面で事前登録する）。
 2. MCP を再スキャンし、ツール2種とイベント `kick` がプラグイン画面に並ぶことを確認する。
 3. Work チャット（または dots）で、`kick` イベントの購読と、届いたときの処理（例：依頼内容を確認し、`list_pending_requests` で照合して、着手時に `update_request_status` で `acknowledged`、終わったら `completed` を返す）を指示する。
 4. こちらから `/trigger` でテスト依頼を送り、dots が起きて反応することを確認する。
@@ -166,18 +179,17 @@ curl -X POST https://dots-events.0g0.xyz/trigger \
 
 ### OAuth 対応の検証（2026-11-06、ローカル自動テスト）
 
-- Miniflare 上で実 Worker を起動する自動テスト12件（`test/oauth.test.mjs`、`npm test` で実行）を作成し、全件合格。内容は「認証（OAuth 2.1）＞検証方法」に記載のとおり（認可フロー実走、異常系トークン、所有者バインディング、重複排除、改ざん Webhook、ローテーション・失効、kick 互換）。
-- 受信側（ChatGPT コールバック）は Miniflare の outboundService で模擬し、Standard Webhooks 署名を Node の crypto で独立に検証した上でチャレンジ応答・配送記録を行った（接続→購読→発火→配送→状態照合までの合成データでの通し検証を含む）。
-- 本番に対して行った確認は読み取りのみ: 無認証の `initialize` / `events/list` / `tools/list` が成功すること（＝現行本番はオープン）、保護リソースメタデータが 404 であること（＝ OAuth 未デプロイ）を確認済み。本番での購読作成・削除・発火は行っていない。
-- 未実施: デプロイ後の ChatGPT 実機での OAuth フローと購読認識の確認（デプロイとシークレット設定が前提のため、本変更のマージ後に所有者の承認を得て実施する）。
+- 初版（内蔵認可サーバー方式）: Miniflare 上の自動テスト12件合格。その後、方式変更に伴いテストも作り替えた。
+- 現行（0g0-id 方式）: `test/auth.test.mjs` の **16件が全件合格**（内容は「認証（OAuth 2.1）＞検証方法」参照）。0g0-id はモック JWKS ＋合成鍵で模擬し、本番 IdP・本番サーバーにはアクセスしていない。
+- 本番に対して行った確認は読み取りのみ: 無認証の `initialize` / `events/list` / `tools/list` が成功すること（＝現行本番はオープンな原初ビルド）、保護リソースメタデータが 404 であることを確認済み。本番での購読作成・削除・発火は行っていない。
+- 未実施: 前提（0g0-id 側 PR・登録）が揃った後の、ChatGPT 実機での認可フローと購読認識の確認。
 
 ## 制限・未確認事項
 
-- **認証（OAuth 2.1）は実装済みだが未デプロイ**（このブランチ／PR の状態）。本番はまだオープンで、購読IDの principal は固定値 `anonymous`。有効化には `OWNER_PASSWORD_HASH` と `AUTH_SECRET` のシークレット設定と同時のデプロイが必要（手順は「認証（OAuth 2.1）」参照）。デプロイ後は認証導入前の `anonymous` 購読には配送されなくなるため、dots 側は再購読が必要。
+- **認証（OAuth 2.1）は実装済みだが未デプロイ**（このブランチ／PR の状態）。本番はまだ認証なしの原初ビルドで稼働しており、購読の principal は固定値 `anonymous`。有効化には本 PR のデプロイに加えて、0g0-id 側の前提（PR マージ・デプロイ・マイグレーション・リソース登録）が必要。デプロイ後は認証導入前の `anonymous` 購読には配送されなくなるため、dots 側は再購読が必要。
+- 本方式は 0g0-id の RFC 8707 実装に依存する。0g0-id 側 PR が未マージの間は、audience 束縛つきトークンは発行できない。
+- 0g0-id は CIMD（Client ID Metadata Documents）未対応で、クライアント登録は DCR と管理登録のみ。ChatGPT の接続形態が CIMD を必須とする場合は、0g0-id 側に追加実装が要る。
 - ChatGPT 側でイベント購読先として認識されない問題と OAuth の有無の因果は未確定。OAuth 実装はその切り分け材料の1つであり、デプロイ後の実機確認で別途判断する。
-- クライアント登録は CIMD（Client ID Metadata Documents）未対応で、DCR と事前登録のみ。ChatGPT が CIMD を必須とする接続形態では追加実装が要る。
-- 認可サーバー側のレート制限は未実装（単一所有者前提）。ログイン試行の総当たり対策はプラットフォーム側の防御に依存する。
-- 認可コードは PKCE 検証に失敗した交換でも消費される（単一使用を原子的に担保するための設計上の選択）。
 - **購読と実配信の dots 側テストは未実施**（上記「接続手順」は dots 側の操作が必要なため）。ここまでで確認できているのはサーバー側の仕様準拠と自己検証まで。
 - SSRF 対策は「HTTPS 必須＋プライベートIPリテラル等の拒否」まで。ガイドが求める「名前解決して検証済みアドレスへ接続」は Workers の fetch では実現できず、部分準拠。
 - Worker から自分自身の URL への fetch は Cloudflare の制限で失敗する（自己検証で確認）。実運用のコールバックは ChatGPT 側の URL なので影響しない。

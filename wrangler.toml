@@ -18,10 +18,12 @@ new_sqlite_classes = ["Store"]
 #   TRIGGER_KEY   admin key for POST /trigger
 #                 (also stored in
 #                  ~/workspace/goals/reason-network/hidden_files/dots-events-trigger-key.txt)
-#   OWNER_PASSWORD_HASH  hex SHA-256 of the owner login password used by the
-#                 OAuth consent flow (OAuth endpoints return 503 and /mcp
-#                 stays locked until this and AUTH_SECRET are set)
-#   AUTH_SECRET   random HMAC key (>= 32 chars) for owner session cookies
+#
+# Plain vars (optional; defaults shown):
+#   IDP_ISSUER    = "https://id.0g0.xyz"  (authorization server, 0g0-id)
+#   JWKS_URI      = "<IDP_ISSUER>/.well-known/jwks.json"
+#   RESOURCE_URI  = this Worker's own /mcp URL (audience required in tokens;
+#                   must match the URI registered in 0g0-id's resource_servers)
 #
 # Test-only plain vars (NOT set in production):
 #   TEST_ECHO=1 and TEST_ECHO_SECRET=<throwaway whsec_> enable POST /test-echo
