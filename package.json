@@ -1,0 +1,13 @@
+{
+  "name": "dots-kick-events",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP Events server that wakes dots (ChatGPT) via signed webhooks, with OAuth 2.1 authorization.",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "miniflare": "^4.20260730.0"
+  }
+}
