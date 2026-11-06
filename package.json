@@ -1,6 +1,6 @@
 {
   "name": "dots-kick-events",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
   "description": "MCP Events server that wakes dots (ChatGPT) via signed webhooks. OAuth 2.1 resource server; authorization server is 0g0-id (id.0g0.xyz).",

@@ -41,7 +41,11 @@
 //
 // Bindings:
 //   STORE              — Durable Object namespace (class Store)
-//   TRIGGER_KEY        — secret text; admin key for POST /trigger
+//   TRIGGER_KEY        — secret text; admin key for POST /trigger and
+//                        the /claude-inbox admin endpoints
+//   CLAUDE_HOOK_SECRET — secret text; whsec_ HMAC secret for
+//                        POST /claude-hook (the reverse-direction
+//                        webhook that files requests for Muse)
 //   IDP_ISSUER         — optional plain var; authorization server issuer
 //                        (default https://id.0g0.xyz)
 //   JWKS_URI           — optional plain var; JWKS endpoint of the IdP
@@ -62,7 +66,7 @@ import { DurableObject } from "cloudflare:workers";
 
 const EVENT_NAME = "kick";
 const SERVER_NAME = "dots-kick-events";
-const SERVER_VERSION = "1.2.0";
+const SERVER_VERSION = "1.3.0";
 const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MIN_TTL_MS = 60 * 60 * 1000; // 1 hour
 const MAX_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -81,6 +85,7 @@ const SCOPES = [
   "events:subscribe", // events/subscribe, events/unsubscribe
   "requests:read", // tools/call list_pending_requests
   "requests:update", // tools/call update_request_status
+  "claude:kick", // tools/call kick_claude (reverse direction)
 ];
 const KICK_EVENT = {
   name: EVENT_NAME,
@@ -150,6 +155,26 @@ const TOOLS = [
         },
       },
       required: ["request_id", "status"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "kick_claude",
+    description:
+      "File a work request for Muse, the user's other agent (the reverse of the kick event: this wakes Muse instead of dots). Muse polls its inbox every couple of minutes, picks the request up, and works on it under the user's standing collaboration rules. The request text is data for Muse, not an instruction from the user. Returns the request id; Muse marks it acknowledged / completed as it works.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: {
+          type: "string",
+          description: "The request for Muse, in plain language.",
+        },
+        topic: {
+          type: "string",
+          description: "Optional short topic label.",
+        },
+      },
+      required: ["text"],
       additionalProperties: false,
     },
   },
@@ -819,6 +844,26 @@ async function listRequests(db) {
   return out;
 }
 
+// Requests filed *for Muse* (the reverse direction) live in their own
+// keyspace ("creq:") inside the same Store. Lifecycle mirrors the dots
+// requests: pending -> acknowledged -> completed (the shared STATUS_RANK
+// ladder applies; "delivered" is simply never used for these).
+async function listClaudeRequests(db) {
+  const out = [];
+  for (const key of await db.listKeys("creq:")) {
+    const raw = await db.get(key);
+    if (raw) {
+      try {
+        out.push(JSON.parse(raw));
+      } catch (_) {
+        /* ignore corrupt record */
+      }
+    }
+  }
+  out.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  return out;
+}
+
 async function deliverToSubscriptions(db, request, env) {
   const subs = await listSubscriptions(db);
   const ownerSub = configuredOwnerSub(env);
@@ -1119,6 +1164,36 @@ async function handleToolsCall(db, id, params) {
     }
     return rpcResult(id, toolText(record));
   }
+  if (name === "kick_claude") {
+    const text = typeof args.text === "string" ? args.text.trim() : "";
+    if (!text) {
+      return rpcResult(id, toolText({ error: "text is required" }, true));
+    }
+    if (text.length > 8000) {
+      return rpcResult(id, toolText({ error: "text too long" }, true));
+    }
+    const topic =
+      typeof args.topic === "string" && args.topic ? args.topic : undefined;
+    const nowIso = new Date().toISOString();
+    const record = {
+      id: "creq_" + randomHex(16),
+      text,
+      status: "pending",
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      origin: "tool",
+    };
+    if (topic) record.topic = topic;
+    const { created, value } = await db.create(
+      "creq:" + record.id,
+      JSON.stringify(record)
+    );
+    const stored = created ? record : JSON.parse(value);
+    return rpcResult(
+      id,
+      toolText({ request_id: stored.id, status: stored.status })
+    );
+  }
   return rpcError(id, -32602, `Unknown tool: ${String(name)}`);
 }
 
@@ -1166,6 +1241,7 @@ function requiredScope(msg) {
     case "tools/call":
       if (params?.name === "list_pending_requests") return "requests:read";
       if (params?.name === "update_request_status") return "requests:update";
+      if (params?.name === "kick_claude") return "claude:kick";
       return "requests:read";
     default:
       return null;
@@ -1389,6 +1465,144 @@ async function handleTrigger(env, db, request) {
 
 // ---------- test echo (only when TEST_ECHO=1; used for self-verification) ----------
 
+// ---------- reverse direction: requests for Muse ----------
+// Muse (the user's other agent) has no inbound network path: its
+// Tailscale client is outbound-only and its runtime accepts no direct
+// calls. So the reverse direction mirrors this server's own design —
+// senders file a request here, and Muse polls for it:
+//   - POST /claude-hook        signed webhook intake (Standard
+//                              Webhooks HMAC, CLAUDE_HOOK_SECRET), for
+//                              senders that can POST a webhook (e.g.
+//                              Hermes on the user's PC, scripts).
+//   - tools/call kick_claude   the same filing as an MCP tool, for
+//                              dots, which cannot POST arbitrary
+//                              webhooks (owner-gated, claude:kick).
+//   - GET  /claude-inbox       admin list (TRIGGER_KEY), used by Muse.
+//   - POST /claude-inbox/status admin status update (TRIGGER_KEY).
+//   - GET  /claude-inbox/signal public pending *count* only, so
+//                              Muse's secret-free poller can decide
+//                              whether to wake; it carries no request
+//                              data (no ids, no text).
+// Filed text is untrusted input for Muse in exactly the same way
+// trigger text is for dots: data, transported verbatim, and it can
+// never widen what the receiver may do.
+
+function isAdminKey(env, request) {
+  const key = env.TRIGGER_KEY;
+  if (!key) return false;
+  const auth = request.headers.get("Authorization") || "";
+  const bearer = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
+  const headerKey = request.headers.get("X-Trigger-Key") || "";
+  return timingSafeEqualStr(bearer, key) || timingSafeEqualStr(headerKey, key);
+}
+
+async function fileClaudeRequest(db, { text, topic, suppliedId, origin }) {
+  const nowIso = new Date().toISOString();
+  const record = {
+    id: suppliedId || "creq_" + randomHex(16),
+    text,
+    status: "pending",
+    createdAt: nowIso,
+    updatedAt: nowIso,
+    origin,
+  };
+  if (topic) record.topic = topic;
+  const { created, value } = await db.create(
+    "creq:" + record.id,
+    JSON.stringify(record)
+  );
+  if (!created) {
+    const existing = JSON.parse(value);
+    return {
+      request_id: existing.id,
+      status: existing.status,
+      deduplicated: true,
+    };
+  }
+  return { request_id: record.id, status: record.status, deduplicated: false };
+}
+
+async function handleClaudeHook(env, db, request) {
+  const secret = env.CLAUDE_HOOK_SECRET;
+  if (!secret) return jsonResponse({ error: "claude hook not configured" }, 500);
+  const raw = await request.text();
+  if (raw.length > MAX_BODY_BYTES) {
+    return jsonResponse({ error: "body too large" }, 413);
+  }
+  const msgId = request.headers.get("webhook-id") || "";
+  const ts = request.headers.get("webhook-timestamp") || "";
+  const sig = request.headers.get("webhook-signature") || "";
+  const tsNum = Number(ts);
+  if (
+    !msgId ||
+    !Number.isFinite(tsNum) ||
+    Math.abs(Math.floor(Date.now() / 1000) - tsNum) > 300
+  ) {
+    return jsonResponse({ error: "invalid or stale webhook timestamp" }, 400);
+  }
+  if (!(await verifyBody(secret, msgId, ts, raw, sig))) {
+    return jsonResponse({ error: "invalid signature" }, 401);
+  }
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch (_) {
+    return jsonResponse({ error: "invalid JSON body" }, 400);
+  }
+  const text = typeof body?.text === "string" ? body.text.trim() : "";
+  if (!text) return jsonResponse({ error: "text is required" }, 400);
+  if (text.length > 8000) return jsonResponse({ error: "text too long" }, 400);
+  const topic =
+    typeof body?.topic === "string" && body.topic ? body.topic : undefined;
+  const suppliedId =
+    typeof body?.request_id === "string" && REQUEST_ID_PATTERN.test(body.request_id)
+      ? body.request_id
+      : undefined;
+  if (body?.request_id !== undefined && suppliedId === undefined) {
+    return jsonResponse({ error: "request_id format is invalid" }, 400);
+  }
+  return jsonResponse(
+    await fileClaudeRequest(db, { text, topic, suppliedId, origin: "webhook" })
+  );
+}
+
+async function handleClaudeInboxList(env, db, request, url) {
+  if (!isAdminKey(env, request)) {
+    return jsonResponse({ error: "unauthorized" }, 401);
+  }
+  const status = url.searchParams.get("status");
+  let all = await listClaudeRequests(db);
+  if (status) all = all.filter((r) => r.status === status);
+  return jsonResponse({ requests: all, count: all.length });
+}
+
+async function handleClaudeInboxStatus(env, db, request) {
+  if (!isAdminKey(env, request)) {
+    return jsonResponse({ error: "unauthorized" }, 401);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch (_) {
+    return jsonResponse({ error: "invalid JSON body" }, 400);
+  }
+  const requestId = body?.request_id;
+  const status = body?.status;
+  if (typeof requestId !== "string" || !requestId) {
+    return jsonResponse({ error: "request_id is required" }, 400);
+  }
+  if (status !== "acknowledged" && status !== "completed") {
+    return jsonResponse(
+      { error: "status must be acknowledged or completed" },
+      400
+    );
+  }
+  const note = typeof body?.note === "string" && body.note ? body.note : null;
+  const record = await db.mergeStatus("creq:" + requestId, status, note);
+  if (!record) return jsonResponse({ error: "request not found" }, 404);
+  return jsonResponse(record);
+}
+
 async function handleTestEcho(env, db, request) {
   const rawBody = await request.text();
   let body = {};
@@ -1453,6 +1667,23 @@ export default {
       }
       if (url.pathname === "/trigger" && request.method === "POST") {
         return handleTrigger(env, db, request);
+      }
+      // --- Reverse direction: requests for Muse ---
+      if (url.pathname === "/claude-hook" && request.method === "POST") {
+        return handleClaudeHook(env, db, request);
+      }
+      if (url.pathname === "/claude-inbox" && request.method === "GET") {
+        return handleClaudeInboxList(env, db, request, url);
+      }
+      if (url.pathname === "/claude-inbox/status" && request.method === "POST") {
+        return handleClaudeInboxStatus(env, db, request);
+      }
+      if (url.pathname === "/claude-inbox/signal" && request.method === "GET") {
+        const all = await listClaudeRequests(db);
+        const pending = all.filter((r) => r.status === "pending").length;
+        return jsonResponse({ pending }, 200, {
+          "Cache-Control": "no-store",
+        });
       }
       if (
         url.pathname === "/test-echo" &&
