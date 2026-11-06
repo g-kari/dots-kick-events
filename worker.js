@@ -10,24 +10,59 @@
 // - Requests ("依頼") are persisted with delivered/acknowledged/completed
 //   states so dots can reconcile unfinished work via tools.
 //
+// Authorization (OAuth 2.1, MCP authorization spec
+// https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization):
+// - The MCP endpoint is a protected resource. Every /mcp call needs a Bearer
+//   access token; unauthenticated calls get 401 + WWW-Authenticate pointing
+//   at the RFC 9728 protected-resource metadata, whose
+//   `authorization_servers` names the authorization server below.
+// - The authorization server is the owner's own IdP, **0g0-id**
+//   (https://id.0g0.xyz) — this Worker never issues tokens. 0g0-id mints
+//   ES256 JWT access tokens whose audience is bound to this MCP endpoint
+//   through the RFC 8707 `resource` parameter (the URI must be registered
+//   in 0g0-id's resource_servers registry), and supports RFC 7591 dynamic
+//   client registration so MCP clients (ChatGPT) can self-register.
+// - Every request is validated against the IdP's JWKS
+//   (https://id.0g0.xyz/.well-known/jwks.json): signature (ES256, key
+//   selected by `kid`, cache with rotation refetch), issuer, audience
+//   (= this resource), expiry, and per-method scope. Subscriptions are
+//   bound to the token's subject (`sub`); one principal cannot touch
+//   another's subscription. Opaque (non-JWT) tokens are rejected.
+// - POST /trigger is a separate machine-to-machine admin endpoint. It is NOT
+//   part of the OAuth flow: it authenticates with TRIGGER_KEY only. The
+//   requester identity therefore comes from possession of that key, never
+//   from fields inside the payload. (The whsec_ webhook signature, in turn,
+//   only proves a delivery came from this server — it says nothing about who
+//   originally filed the request.)
+//
 // Storage: a single Durable Object ("Store", SQLite-backed) holds
 // subscriptions and requests. (This Cloudflare connection has no KV/D1
 // permissions, so storage lives inside the Worker platform itself.)
 //
 // Bindings:
-//   STORE         — Durable Object namespace (class Store)
-//   TRIGGER_KEY   — secret text; admin key for POST /trigger
-//   TEST_ECHO     — optional plain var; when "1", enables POST /test-echo
-//   TEST_ECHO_SECRET — optional plain var; throwaway whsec_ used only by /test-echo
-//
-// Note: this endpoint currently has no OAuth layer (the MCP endpoint is open).
-// See README.md "制限・未確認事項".
+//   STORE              — Durable Object namespace (class Store)
+//   TRIGGER_KEY        — secret text; admin key for POST /trigger
+//   IDP_ISSUER         — optional plain var; authorization server issuer
+//                        (default https://id.0g0.xyz)
+//   JWKS_URI           — optional plain var; JWKS endpoint of the IdP
+//                        (default <IDP_ISSUER>/.well-known/jwks.json)
+//   RESOURCE_URI       — optional plain var; audience this resource
+//                        requires (default: this Worker's own /mcp URL)
+//   OWNER_SUB          — plain var; the 0g0-id subject (`sub`) of the one
+//                        owner allowed to use the data-bearing / mutating
+//                        MCP methods (events/subscribe, events/unsubscribe,
+//                        both tools). Deliveries go only to this owner's
+//                        subscriptions. Unset/empty rejects everyone
+//                        (fail closed). The production value is set at
+//                        deploy time; it is never committed to this repo.
+//   TEST_ECHO          — optional plain var; when "1", enables POST /test-echo
+//   TEST_ECHO_SECRET   — optional plain var; throwaway whsec_ used only by /test-echo
 
 import { DurableObject } from "cloudflare:workers";
 
 const EVENT_NAME = "kick";
 const SERVER_NAME = "dots-kick-events";
-const SERVER_VERSION = "1.0.0";
+const SERVER_VERSION = "1.2.0";
 const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MIN_TTL_MS = 60 * 60 * 1000; // 1 hour
 const MAX_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -35,6 +70,18 @@ const VERIFY_CACHE_MS = 24 * 60 * 60 * 1000; // 24 hours
 const PREV_SECRET_WINDOW_MS = 10 * 60 * 1000; // sign with old+new key briefly after rotation
 const MAX_BODY_BYTES = 256 * 1024;
 
+// ---------- OAuth constants (resource server) ----------
+
+const LEGACY_PRINCIPAL = "anonymous"; // pre-auth subscriptions (self-verification era); excluded from delivery
+
+// Scopes (least privilege per operation; all are listed in the metadata and
+// in the WWW-Authenticate challenge so clients request exactly these).
+const SCOPES = [
+  "events:read", // events/list
+  "events:subscribe", // events/subscribe, events/unsubscribe
+  "requests:read", // tools/call list_pending_requests
+  "requests:update", // tools/call update_request_status
+];
 const KICK_EVENT = {
   name: EVENT_NAME,
   description:
@@ -110,6 +157,10 @@ const TOOLS = [
 
 // ---------- Durable Object storage ----------
 
+// Request lifecycle ranks. Status merges only ever move a record
+// forward along this ladder; nothing writes a status backwards.
+const STATUS_RANK = { pending: 0, delivered: 1, acknowledged: 2, completed: 3 };
+
 export class Store extends DurableObject {
   async fetch(request) {
     const url = new URL(request.url);
@@ -133,6 +184,105 @@ export class Store extends DurableObject {
     if (url.pathname === "/list") {
       const map = await s.list({ prefix: url.searchParams.get("prefix") || "" });
       return Response.json({ keys: [...map.keys()] });
+    }
+    if (url.pathname === "/take") {
+      // Atomic get+delete (single-use values: authorization codes, refresh
+      // tokens). blockConcurrencyWhile makes the pair indivisible even if
+      // two callers race.
+      const key = url.searchParams.get("key");
+      let v;
+      await this.ctx.blockConcurrencyWhile(async () => {
+        v = await s.get(key);
+        if (v !== undefined) await s.delete(key);
+      });
+      return v === undefined
+        ? new Response(null, { status: 404 })
+        : new Response(v, { headers: { "Content-Type": "text/plain" } });
+    }
+    if (url.pathname === "/create") {
+      // Atomic put-if-absent. Used for client-supplied request_id dedup so a
+      // retried /trigger can never create (and deliver) the same request
+      // twice, even when two sends arrive at the same time.
+      const { key, value } = await request.json();
+      let created = false;
+      let current = value;
+      await this.ctx.blockConcurrencyWhile(async () => {
+        const existing = await s.get(key);
+        if (existing === undefined) {
+          await s.put(key, value);
+          created = true;
+        } else {
+          current = existing;
+        }
+      });
+      return Response.json({ created, value: current });
+    }
+    if (url.pathname === "/merge-delivery") {
+      // Merge delivery results into the CURRENT record. The caller holds
+      // a snapshot taken before delivery; while delivery was in flight
+      // the receiver may have advanced the record (acknowledged /
+      // completed, notes). Writing the stale snapshot back wholesale
+      // would roll that back, so only the delivery fields are merged
+      // here, atomically: deliveries are appended and the status only
+      // ever advances (pending < delivered < acknowledged < completed).
+      const { key, deliveries, anyOk } = await request.json();
+      let merged = null;
+      await this.ctx.blockConcurrencyWhile(async () => {
+        const raw = await s.get(key);
+        if (raw === undefined) return;
+        const record = JSON.parse(raw);
+        const existing = Array.isArray(record.deliveries)
+          ? record.deliveries
+          : [];
+        record.deliveries = [
+          ...existing,
+          ...(Array.isArray(deliveries) ? deliveries : []),
+        ];
+        const computed = anyOk ? "delivered" : "pending";
+        if ((STATUS_RANK[record.status] ?? 0) < (STATUS_RANK[computed] ?? 0)) {
+          record.status = computed;
+        }
+        record.updatedAt = new Date().toISOString();
+        await s.put(key, JSON.stringify(record));
+        merged = record;
+      });
+      return merged === null
+        ? new Response(null, { status: 404 })
+        : Response.json(merged);
+    }
+    if (url.pathname === "/merge-status") {
+      // Merge a status update (update_request_status) into the CURRENT
+      // record, atomically. The tool handler used to read the record in
+      // the Worker, edit the snapshot, and write it back wholesale —
+      // a read-modify-write outside this object's serialization, so a
+      // delivery merge landing between the read and the write was
+      // silently overwritten (delivery results lost), and two racing
+      // updates overwrote each other's notes. Here the update is a
+      // field-level merge against the latest record instead: the
+      // status only advances along STATUS_RANK (an "acknowledged"
+      // arriving after "completed" cannot regress it) and a note, when
+      // present, is appended to the current notes array.
+      const { key, status, note } = await request.json();
+      let merged = null;
+      await this.ctx.blockConcurrencyWhile(async () => {
+        const raw = await s.get(key);
+        if (raw === undefined) return;
+        const record = JSON.parse(raw);
+        const nowIso = new Date().toISOString();
+        if ((STATUS_RANK[status] ?? -1) > (STATUS_RANK[record.status] ?? 0)) {
+          record.status = status;
+        }
+        if (typeof note === "string" && note) {
+          record.notes = Array.isArray(record.notes) ? record.notes : [];
+          record.notes.push({ status, note, at: nowIso });
+        }
+        record.updatedAt = nowIso;
+        await s.put(key, JSON.stringify(record));
+        merged = record;
+      });
+      return merged === null
+        ? new Response(null, { status: 404 })
+        : Response.json(merged);
     }
     return new Response("not found", { status: 404 });
   }
@@ -168,15 +318,54 @@ function store(env) {
       const j = await r.json();
       return j.keys || [];
     },
+    // Atomically fetch-and-delete a key; returns the value or null.
+    async take(key) {
+      const r = await stub.fetch(
+        "https://store/take?key=" + encodeURIComponent(key)
+      );
+      if (r.status === 404) return null;
+      return r.text();
+    },
+    // Atomically store only if absent; returns { created, value } where
+    // value is the stored (possibly pre-existing) record.
+    async create(key, value) {
+      const r = await stub.fetch("https://store/create", {
+        method: "POST",
+        body: JSON.stringify({ key, value }),
+      });
+      return r.json();
+    },
+    // Atomically merge delivery results into the current stored record
+    // (see the Store "/merge-delivery" endpoint); returns the merged
+    // record, or null if the key no longer exists.
+    async mergeDelivery(key, deliveries, anyOk) {
+      const r = await stub.fetch("https://store/merge-delivery", {
+        method: "POST",
+        body: JSON.stringify({ key, deliveries, anyOk }),
+      });
+      if (r.status === 404) return null;
+      return r.json();
+    },
+    // Atomically merge a status update into the current stored record
+    // (see the Store "/merge-status" endpoint); returns the merged
+    // record, or null if the key does not exist.
+    async mergeStatus(key, status, note) {
+      const r = await stub.fetch("https://store/merge-status", {
+        method: "POST",
+        body: JSON.stringify({ key, status, note: note ?? null }),
+      });
+      if (r.status === 404) return null;
+      return r.json();
+    },
   };
 }
 
 // ---------- small helpers ----------
 
-function jsonResponse(obj, status = 200) {
+function jsonResponse(obj, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...extraHeaders },
   });
 }
 
@@ -233,7 +422,21 @@ function b64decode(str) {
   return bytes;
 }
 
-// Constant-time string comparison (for challenges / admin key).
+function b64urlEncode(bytes) {
+  return b64encode(bytes)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function b64urlDecode(str) {
+  let s = String(str).replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return b64decode(s);
+}
+
+
+// Constant-time string comparison (for challenges / admin key / hashes).
 function timingSafeEqualStr(a, b) {
   const ea = new TextEncoder().encode(String(a));
   const eb = new TextEncoder().encode(String(b));
@@ -244,6 +447,7 @@ function timingSafeEqualStr(a, b) {
   }
   return diff === 0;
 }
+
 
 // ---------- Standard Webhooks signing ----------
 
@@ -303,6 +507,73 @@ async function signatureHeader(subscription, msgId, timestampSec, body) {
 // ---------- callback URL validation (SSRF basics) ----------
 // Workers fetch resolves DNS inside Cloudflare's network, so we cannot pin
 // the resolved address; we enforce HTTPS and reject local/private literals.
+
+// Private / non-routable IPv4 ranges, judged by the first two octets.
+function isPrivateIPv4(a, b) {
+  return (
+    a === 0 || a === 10 || a === 127 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 169 && b === 254) ||
+    a >= 224
+  );
+}
+
+// Parse an IPv6 literal (brackets already stripped) into eight 16-bit
+// groups, or null when malformed. A trailing dotted IPv4 tail counts as
+// two groups. WHATWG URL keeps the brackets on IPv6 hostnames
+// ("[::1]"), so callers must strip them first — comparing the bracketed
+// form against "::1" etc. would never match and let loopback through.
+function parseIPv6(host) {
+  let addr = host;
+  if (addr.includes(".")) {
+    const m = addr.match(/(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!m) return null;
+    const n = m.slice(1).map(Number);
+    if (n.some((x) => x > 255)) return null;
+    const hi = ((n[0] << 8) | n[1]).toString(16);
+    const lo = ((n[2] << 8) | n[3]).toString(16);
+    addr = addr.slice(0, addr.length - m[0].length) + hi + ":" + lo;
+  }
+  const parsePieces = (s) => {
+    if (s === "") return [];
+    const out = [];
+    for (const p of s.split(":")) {
+      if (!/^[0-9a-fA-F]{1,4}$/.test(p)) return null;
+      out.push(parseInt(p, 16));
+    }
+    return out;
+  };
+  const halves = addr.split("::");
+  if (halves.length > 2) return null;
+  if (halves.length === 2) {
+    const left = parsePieces(halves[0]);
+    const right = parsePieces(halves[1]);
+    if (left === null || right === null) return null;
+    const missing = 8 - left.length - right.length;
+    if (missing < 1) return null; // "::" must compress at least one group
+    return [...left, ...new Array(missing).fill(0), ...right];
+  }
+  const groups = parsePieces(addr);
+  return groups !== null && groups.length === 8 ? groups : null;
+}
+
+function isPrivateIPv6(groups) {
+  const g = groups;
+  // Loopback ::1 and unspecified ::
+  if (g.every((x, i) => x === (i === 7 ? 1 : 0))) return true;
+  if (g.every((x) => x === 0)) return true;
+  if ((g[0] & 0xfe00) === 0xfc00) return true; // ULA fc00::/7
+  if ((g[0] & 0xffc0) === 0xfe80) return true; // link-local fe80::/10
+  if ((g[0] & 0xff00) === 0xff00) return true; // multicast ff00::/8
+  // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d): judge
+  // the embedded IPv4 address by the IPv4 rules.
+  if (g.slice(0, 5).every((x) => x === 0) && (g[5] === 0xffff || g[5] === 0)) {
+    return isPrivateIPv4(g[6] >> 8, g[6] & 0xff);
+  }
+  return false;
+}
+
 function validateCallbackUrl(raw) {
   let u;
   try {
@@ -316,27 +587,18 @@ function validateCallbackUrl(raw) {
     return "blocked_host";
   const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (v4) {
-    const a = Number(v4[1]);
-    const b = Number(v4[2]);
-    if (
-      a === 0 || a === 10 || a === 127 ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 169 && b === 254) ||
-      a >= 224
-    )
-      return "private_address";
+    if (isPrivateIPv4(Number(v4[1]), Number(v4[2]))) return "private_address";
+    return null;
   }
-  if (host.includes(":")) {
-    if (
-      host === "::1" ||
-      host.startsWith("fe8") || host.startsWith("fe9") ||
-      host.startsWith("fea") || host.startsWith("feb") ||
-      host.startsWith("fc") || host.startsWith("fd") ||
-      host.startsWith("::ffff:")
-    )
-      return "private_address";
+  if (host.startsWith("[") && host.endsWith("]")) {
+    // IPv6 literal: strip the WHATWG brackets, then classify by groups
+    // (loopback, ULA, link-local, IPv4-mapped, ...). Unparseable input
+    // fails closed.
+    const groups = parseIPv6(host.slice(1, -1));
+    if (!groups || isPrivateIPv6(groups)) return "private_address";
+    return null;
   }
+  if (host.includes(":")) return "private_address"; // unbracketed colon host: fail closed
   return null;
 }
 
@@ -361,6 +623,10 @@ async function postSigned(url, subscription, msgId, body) {
 }
 
 // ---------- subscriptions ----------
+// A subscription belongs to the authenticated principal that created it: the
+// principal is part of the deterministic subscription ID, and the record
+// stores it, so a different principal computing the same (url, name, args)
+// triple lands on a different ID and can neither read nor delete this one.
 
 async function subscriptionId(principal, url, name, args) {
   const hash = await sha256Hex(
@@ -403,7 +669,7 @@ function validateSecret(secret) {
   }
 }
 
-async function handleSubscribe(db, id, params) {
+async function handleSubscribe(db, id, params, principal) {
   const name = params?.name;
   const args = params?.arguments ?? {};
   const delivery = params?.delivery ?? {};
@@ -437,7 +703,6 @@ async function handleSubscribe(db, id, params) {
     );
   }
 
-  const principal = "anonymous"; // no OAuth layer yet; see README
   const subId = await subscriptionId(principal, delivery.url, name, args);
   const existingRaw = await db.get("sub:" + subId);
   const existing = existingRaw ? JSON.parse(existingRaw) : null;
@@ -448,6 +713,7 @@ async function handleSubscribe(db, id, params) {
 
   const subscription = {
     id: subId,
+    principal,
     name,
     arguments: args,
     callbackUrl: delivery.url,
@@ -474,10 +740,7 @@ async function handleSubscribe(db, id, params) {
     Date.parse(existing.verifiedUntil) > now;
 
   if (!verificationCached) {
-    const challenge = b64encode(crypto.getRandomValues(new Uint8Array(32)))
-      .replace(/\+/g, "-")
-      .replace(/\//g, "_")
-      .replace(/=+$/, "");
+    const challenge = b64urlEncode(crypto.getRandomValues(new Uint8Array(32)));
     const verifyBodyText = JSON.stringify({ type: "verification", challenge });
     const verifyMsgId = "msg_verification_" + randomHex(12);
     let response;
@@ -518,14 +781,23 @@ async function handleSubscribe(db, id, params) {
   });
 }
 
-async function handleUnsubscribe(db, id, params) {
+async function handleUnsubscribe(db, id, params, principal) {
   const name = params?.name;
   const args = params?.arguments ?? {};
   const url = params?.delivery?.url;
   if (name && url) {
-    const subId = await subscriptionId("anonymous", url, name, args);
-    await db.delete("sub:" + subId);
+    const subId = await subscriptionId(principal, url, name, args);
+    const raw = await db.get("sub:" + subId);
+    if (raw) {
+      const record = JSON.parse(raw);
+      // Ownership check (defense in depth — the ID already embeds the
+      // principal): never delete a subscription owned by someone else.
+      if (!record.principal || record.principal === principal) {
+        await db.delete("sub:" + subId);
+      }
+    }
   }
+  // Idempotent: always an empty result, whether or not anything matched.
   return rpcResult(id, {});
 }
 
@@ -547,17 +819,30 @@ async function listRequests(db) {
   return out;
 }
 
-async function deliverToSubscriptions(db, request) {
+async function deliverToSubscriptions(db, request, env) {
   const subs = await listSubscriptions(db);
+  const ownerSub = configuredOwnerSub(env);
   const now = Date.now();
   const results = [];
   for (const sub of subs) {
     if (sub.name !== EVENT_NAME) continue;
+    // Pre-OAuth subscriptions (principal "anonymous" or missing) were
+    // self-verification artifacts; they no longer receive deliveries.
+    if (!sub.principal || sub.principal === LEGACY_PRINCIPAL) continue;
+    // Deliveries go only to the configured owner's subscriptions. A
+    // subscription record belonging to any other principal (e.g. created
+    // before the owner restriction existed) must not receive request
+    // payloads. OWNER_SUB unset means no deliveries at all (fail closed).
+    if (!ownerSub || sub.principal !== ownerSub) continue;
     if (sub.refreshBefore && Date.parse(sub.refreshBefore) <= now) continue;
     const filterTopic = sub.arguments?.topic;
     if (filterTopic && request.topic && filterTopic !== request.topic) continue;
     if (filterTopic && !request.topic) continue;
 
+    // The eventId is deterministic per (request, subscription) and stable
+    // across retries, so the receiver can dedupe re-deliveries. A webhook
+    // 2xx only acknowledges receipt — completion is reported separately
+    // through update_request_status.
     const eventId =
       "evt_" +
       (await sha256Hex(request.id + ":" + sub.id)).slice(0, 32);
@@ -604,6 +889,190 @@ async function deliverToSubscriptions(db, request) {
   return results;
 }
 
+// ---------- OAuth: resource-server side (0g0-id is the authorization server) ----------
+
+// Authorization is delegated to the owner's own IdP, 0g0-id
+// (https://id.0g0.xyz). This Worker is a pure OAuth 2.1 resource server: it
+// never issues tokens. Access tokens are ES256 JWTs minted by 0g0-id with
+// the audience bound to this MCP endpoint via the RFC 8707 `resource`
+// parameter, validated on every request against the IdP's JWKS.
+const DEFAULT_IDP_ISSUER = "https://id.0g0.xyz";
+const JWKS_CACHE_MS = 10 * 60 * 1000; // 10 minutes
+const JWKS_REFETCH_MIN_MS = 1000; // minimum gap between forced refetches (unknown kid)
+
+function idpIssuer(env) {
+  return (env && env.IDP_ISSUER) || DEFAULT_IDP_ISSUER;
+}
+function jwksUri(env) {
+  return (env && env.JWKS_URI) || idpIssuer(env) + "/.well-known/jwks.json";
+}
+// The audience this resource requires. 0g0-id binds it from the `resource`
+// parameter, so it must exactly match the URI registered for this server in
+// 0g0-id's resource_servers registry. Defaults to this Worker's own /mcp
+// URL; RESOURCE_URI overrides it (used by tests).
+function expectedAudience(request, env) {
+  if (env && env.RESOURCE_URI) return env.RESOURCE_URI;
+  return new URL(request.url).origin + "/mcp";
+}
+
+function protectedResourceMetadata(request, env) {
+  const origin = new URL(request.url).origin;
+  return {
+    resource: expectedAudience(request, env),
+    authorization_servers: [idpIssuer(env)],
+    scopes_supported: SCOPES,
+    bearer_methods_supported: ["header"],
+    resource_documentation: origin + "/",
+  };
+}
+
+function wwwAuthenticate(request, env, extra = {}) {
+  const origin = new URL(request.url).origin;
+  const parts = [
+    `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
+  ];
+  if (extra.error) parts.push(`error="${extra.error}"`);
+  parts.push(`scope="${(extra.scope || SCOPES).join(" ")}"`);
+  return parts.join(", ");
+}
+
+function unauthorized(request, env, error) {
+  return jsonResponse(
+    { error: error || "unauthorized" },
+    401,
+    {
+      "WWW-Authenticate": wwwAuthenticate(request, env, {
+        error: error ? "invalid_token" : undefined,
+      }),
+      "Cache-Control": "no-store",
+    }
+  );
+}
+
+// ---------- JWT validation against the IdP JWKS ----------
+
+let jwksCache = { keys: null, fetchedAt: 0, lastForcedRefetch: 0 };
+
+async function fetchJwks(env) {
+  const res = await fetch(jwksUri(env), {
+    headers: { Accept: "application/json" },
+  });
+  if (!res.ok) throw new Error("JWKS fetch failed: " + res.status);
+  const doc = await res.json();
+  if (!doc || !Array.isArray(doc.keys)) {
+    throw new Error("JWKS document has no keys");
+  }
+  jwksCache = {
+    keys: doc.keys,
+    fetchedAt: Date.now(),
+    lastForcedRefetch: jwksCache.lastForcedRefetch,
+  };
+  return doc.keys;
+}
+
+async function getJwk(env, kid) {
+  const now = Date.now();
+  let keys = jwksCache.keys;
+  if (!keys || now - jwksCache.fetchedAt > JWKS_CACHE_MS) {
+    keys = await fetchJwks(env);
+  }
+  let jwk = keys.find((k) => k.kid === kid);
+  if (!jwk && now - jwksCache.lastForcedRefetch > JWKS_REFETCH_MIN_MS) {
+    // Unknown kid: the IdP may have rotated its signing key. Refetch once.
+    jwksCache.lastForcedRefetch = now;
+    keys = await fetchJwks(env);
+    jwk = keys.find((k) => k.kid === kid);
+  }
+  return jwk || null;
+}
+
+const keyCache = new Map(); // kid -> CryptoKey
+
+async function jwkToKey(jwk) {
+  if (keyCache.has(jwk.kid)) return keyCache.get(jwk.kid);
+  const key = await crypto.subtle.importKey(
+    "jwk",
+    { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y },
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["verify"]
+  );
+  keyCache.set(jwk.kid, key);
+  return key;
+}
+
+// Validate a Bearer access token issued by 0g0-id. Checks: JWS structure,
+// alg (ES256 only), signature against the JWKS key selected by kid, issuer,
+// audience (= this resource), expiry / not-before, subject presence, and
+// scope claims. Returns { principal, clientId, scope:Set } or null. The
+// subscription owner is the token subject.
+async function authenticate(env, request) {
+  const auth = request.headers.get("Authorization") || "";
+  if (!auth.startsWith("Bearer ")) return null;
+  const token = auth.slice("Bearer ".length).trim();
+  const parts = token.split(".");
+  if (parts.length !== 3) return null; // opaque tokens are not accepted
+  let header, claims;
+  try {
+    header = JSON.parse(new TextDecoder().decode(b64urlDecode(parts[0])));
+    claims = JSON.parse(new TextDecoder().decode(b64urlDecode(parts[1])));
+  } catch (_) {
+    return null;
+  }
+  if (header.alg !== "ES256" || typeof header.kid !== "string" || !header.kid) {
+    return null;
+  }
+  let jwk;
+  try {
+    jwk = await getJwk(env, header.kid);
+  } catch (_) {
+    return null;
+  }
+  if (!jwk || jwk.kty !== "EC" || jwk.crv !== "P-256") return null;
+  let signatureOk = false;
+  try {
+    const key = await jwkToKey(jwk);
+    signatureOk = await crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" },
+      key,
+      b64urlDecode(parts[2]),
+      new TextEncoder().encode(parts[0] + "." + parts[1])
+    );
+  } catch (_) {
+    return null;
+  }
+  if (!signatureOk) return null;
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (claims.iss !== idpIssuer(env)) return null;
+  const expected = expectedAudience(request, env);
+  const aud = claims.aud;
+  if (!(aud === expected || (Array.isArray(aud) && aud.includes(expected)))) {
+    return null;
+  }
+  if (typeof claims.exp !== "number" || claims.exp <= nowSec) return null;
+  if (typeof claims.nbf === "number" && claims.nbf > nowSec) return null;
+  if (typeof claims.sub !== "string" || !claims.sub) return null;
+
+  const scope = new Set();
+  if (typeof claims.scope === "string") {
+    for (const s of claims.scope.split(" ")) if (s) scope.add(s);
+  }
+  if (Array.isArray(claims.scp)) {
+    for (const s of claims.scp) if (typeof s === "string" && s) scope.add(s);
+  }
+  return {
+    principal: claims.sub,
+    clientId:
+      typeof claims.cid === "string"
+        ? claims.cid
+        : typeof claims.client_id === "string"
+          ? claims.client_id
+          : null,
+    scope,
+  };
+}
+
 // ---------- tools ----------
 
 function toolText(obj, isError = false) {
@@ -637,26 +1106,73 @@ async function handleToolsCall(db, id, params) {
         toolText({ error: "status must be acknowledged or completed" }, true)
       );
     }
-    const raw = await db.get("req:" + requestId);
-    if (!raw) {
+    // The update is applied as a serialized field-level merge inside
+    // the Durable Object (see "/merge-status"), never as a wholesale
+    // write of a snapshot read here: a delivery merge landing while
+    // this call is in flight must not be overwritten, and two racing
+    // updates must not lose each other's notes.
+    const note =
+      typeof args.note === "string" && args.note ? args.note : null;
+    const record = await db.mergeStatus("req:" + requestId, status, note);
+    if (!record) {
       return rpcResult(id, toolText({ error: "request not found" }, true));
     }
-    const record = JSON.parse(raw);
-    record.status = status;
-    record.updatedAt = new Date().toISOString();
-    if (typeof args.note === "string" && args.note) {
-      record.notes = record.notes || [];
-      record.notes.push({ status, note: args.note, at: record.updatedAt });
-    }
-    await db.put("req:" + requestId, JSON.stringify(record));
     return rpcResult(id, toolText(record));
   }
   return rpcError(id, -32602, `Unknown tool: ${String(name)}`);
 }
 
-// ---------- MCP endpoint ----------
+// ---------- MCP endpoint (protected resource) ----------
 
-async function handleRpc(db, msg) {
+// ---------- owner restriction ----------
+// This is a single-owner personal service. A valid token proves *some*
+// IdP user completed the authorization flow for this resource — it does
+// not make them the owner. The data-bearing / mutating methods
+// (events/subscribe, events/unsubscribe, and both tools) additionally
+// require the token subject to equal OWNER_SUB. OWNER_SUB unset or empty
+// rejects everyone (fail closed), so a deployment that forgets the
+// setting exposes nothing. Public metadata and the read-only discovery
+// methods (initialize, server/discover, ping, tools/list, events/list)
+// are unchanged: they carry no request data.
+function configuredOwnerSub(env) {
+  const v = env && env.OWNER_SUB;
+  return typeof v === "string" && v ? v : null;
+}
+
+function requiresOwner(msg) {
+  const { method } = msg || {};
+  return (
+    method === "events/subscribe" ||
+    method === "events/unsubscribe" ||
+    method === "tools/call"
+  );
+}
+
+function isOwner(env, auth) {
+  const owner = configuredOwnerSub(env);
+  return owner !== null && auth !== null && auth.principal === owner;
+}
+
+// Scope required per JSON-RPC method (null = any valid token). tools/call is
+// resolved per tool name.
+function requiredScope(msg) {
+  const { method, params } = msg || {};
+  switch (method) {
+    case "events/list":
+      return "events:read";
+    case "events/subscribe":
+    case "events/unsubscribe":
+      return "events:subscribe";
+    case "tools/call":
+      if (params?.name === "list_pending_requests") return "requests:read";
+      if (params?.name === "update_request_status") return "requests:update";
+      return "requests:read";
+    default:
+      return null;
+  }
+}
+
+async function handleRpc(db, msg, auth) {
   const { id, method, params } = msg || {};
   const isNotification = id === undefined || id === null;
 
@@ -685,16 +1201,16 @@ async function handleRpc(db, msg) {
     case "events/list":
       return rpcResult(id, { events: [KICK_EVENT] });
     case "events/subscribe":
-      return handleSubscribe(db, id, params || {});
+      return handleSubscribe(db, id, params || {}, auth.principal);
     case "events/unsubscribe":
-      return handleUnsubscribe(db, id, params || {});
+      return handleUnsubscribe(db, id, params || {}, auth.principal);
     default:
       if (isNotification) return null; // notifications need no response
       return rpcError(id, -32601, `Method not found: ${String(method)}`);
   }
 }
 
-async function handleMcp(db, request) {
+async function handleMcp(db, request, env) {
   const text = await request.text();
   if (text.length > MAX_BODY_BYTES) {
     return jsonResponse(rpcError(null, -32600, "Request too large"), 413);
@@ -705,22 +1221,80 @@ async function handleMcp(db, request) {
   } catch (_) {
     return jsonResponse(rpcError(null, -32700, "Parse error"), 400);
   }
-  if (Array.isArray(parsed)) {
-    const responses = [];
-    for (const msg of parsed) {
-      const res = await handleRpc(db, msg);
-      if (res) responses.push(res);
+
+  // Every MCP call must carry a valid access token for this resource.
+  const presented = (request.headers.get("Authorization") || "").startsWith("Bearer ");
+  const auth = await authenticate(env, request);
+  if (!auth) return unauthorized(request, env, presented);
+
+  const messages = Array.isArray(parsed) ? parsed : [parsed];
+  const responses = [];
+  for (const msg of messages) {
+    const need = requiredScope(msg);
+    if (need && !auth.scope.has(need)) {
+      const errBody = rpcError(msg?.id ?? null, -32003, "insufficient_scope", {
+        error: "insufficient_scope",
+        scope: need,
+      });
+      if (!Array.isArray(parsed)) {
+        // Single request: signal step-up authorization at the HTTP layer.
+        return jsonResponse(errBody, 403, {
+          "WWW-Authenticate": wwwAuthenticate(request, env, {
+            error: "insufficient_scope",
+            scope: [need],
+          }),
+        });
+      }
+      responses.push(errBody);
+      continue;
     }
-    if (responses.length === 0) return new Response(null, { status: 202 });
-    return jsonResponse(responses);
+    if (requiresOwner(msg) && !isOwner(env, auth)) {
+      const errBody = rpcError(
+        msg?.id ?? null,
+        -32001,
+        "forbidden: caller is not the resource owner",
+        { error: "forbidden" }
+      );
+      if (!Array.isArray(parsed)) {
+        return jsonResponse(errBody, 403);
+      }
+      responses.push(errBody);
+      continue;
+    }
+    const res = await handleRpc(db, msg, auth);
+    if (res) responses.push(res);
   }
-  const isNotification = parsed.id === undefined || parsed.id === null;
-  const res = await handleRpc(db, parsed);
-  if (res === null || isNotification) return new Response(null, { status: 202 });
-  return jsonResponse(res);
+  if (!Array.isArray(parsed)) {
+    const isNotification = parsed.id === undefined || parsed.id === null;
+    if (responses.length === 0 || isNotification) {
+      return new Response(null, { status: 202 });
+    }
+    return jsonResponse(responses[0]);
+  }
+  if (responses.length === 0) return new Response(null, { status: 202 });
+  return jsonResponse(responses);
 }
 
-// ---------- trigger endpoint (admin) ----------
+// ---------- trigger endpoint (admin, NOT OAuth) ----------
+//
+// This endpoint authenticates the *sender* with TRIGGER_KEY alone, outside
+// the OAuth flow: only the server owner holds that key, so the sender's
+// identity is established by the key — never by payload fields. Accordingly
+// only a whitelist of payload fields is read (text, topic, request_id);
+// anything else a caller sends (e.g. status, callback_url, deliver_to,
+// report_to) is ignored and cannot change delivery targets, request status,
+// or permissions.
+//
+// The delivered `text` is untrusted external input for the receiver. It is
+// transported verbatim as data (payloadSchema-typed string) and the payload
+// carries no fields that could widen what the receiver may do with it.
+//
+// Replay / duplication: callers may supply their own request_id. Creation is
+// atomic (put-if-absent in the Durable Object), so a re-sent trigger — even
+// two copies arriving at the same time — returns the existing record and
+// never delivers twice. (Without a supplied request_id, each call creates
+// a fresh server-generated ID, as before.)
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 async function handleTrigger(env, db, request) {
   const key = env.TRIGGER_KEY;
@@ -745,28 +1319,63 @@ async function handleTrigger(env, db, request) {
   if (text.length > 8000) return jsonResponse({ error: "text too long" }, 400);
   const topic =
     typeof body?.topic === "string" && body.topic ? body.topic : undefined;
+  const suppliedId =
+    typeof body?.request_id === "string" && REQUEST_ID_PATTERN.test(body.request_id)
+      ? body.request_id
+      : undefined;
+  if (body?.request_id !== undefined && suppliedId === undefined) {
+    return jsonResponse({ error: "request_id format is invalid" }, 400);
+  }
 
   const nowIso = new Date().toISOString();
   const record = {
-    id: "req_" + randomHex(16),
+    id: suppliedId || "req_" + randomHex(16),
     text,
     status: "pending",
     createdAt: nowIso,
     updatedAt: nowIso,
     deliveries: [],
+    origin: "trigger",
   };
   if (topic) record.topic = topic;
-  await db.put("req:" + record.id, JSON.stringify(record));
 
-  const results = await deliverToSubscriptions(db, record);
-  record.deliveries = results;
-  if (results.some((r) => r.ok)) record.status = "delivered";
-  record.updatedAt = new Date().toISOString();
-  await db.put("req:" + record.id, JSON.stringify(record));
+  // Creation always goes through the atomic put-if-absent, for
+  // server-generated IDs too: every write to a request record is then
+  // one of the Durable Object's serialized operations (create,
+  // merge-delivery, merge-status), and no path writes back a snapshot
+  // read in the Worker.
+  const { created, value } = await db.create(
+    "req:" + record.id,
+    JSON.stringify(record)
+  );
+  if (!created) {
+    const existing = JSON.parse(value);
+    const deliveries = Array.isArray(existing.deliveries) ? existing.deliveries : [];
+    return jsonResponse({
+      request_id: existing.id,
+      status: existing.status,
+      deduplicated: true,
+      subscriptions_matched: deliveries.length,
+      delivered: deliveries.filter((r) => r.ok).length,
+    });
+  }
+
+  const results = await deliverToSubscriptions(db, record, env);
+  // Merge the outcome into the latest stored record inside the DO: a
+  // status update (acknowledged / completed, with notes) may have landed
+  // while delivery was in flight, and writing this handler's pre-delivery
+  // snapshot back would roll it back to "delivered" and drop the notes.
+  const merged = await db.mergeDelivery(
+    "req:" + record.id,
+    results,
+    results.some((r) => r.ok)
+  );
+  const final = merged || record;
 
   return jsonResponse({
     request_id: record.id,
-    status: record.status,
+    status: final.status,
+    deduplicated: false,
     subscriptions_matched: results.length,
     delivered: results.filter((r) => r.ok).length,
     results: results.map((r) => ({
@@ -826,8 +1435,20 @@ export default {
     const url = new URL(request.url);
     try {
       const db = store(env);
+
+      // --- Discovery metadata (public; contains no secrets) ---
+      if (
+        url.pathname === "/.well-known/oauth-protected-resource" ||
+        url.pathname === "/.well-known/oauth-protected-resource/mcp"
+      ) {
+        if (request.method !== "GET") return jsonResponse({ error: "not found" }, 404);
+        return jsonResponse(protectedResourceMetadata(request, env), 200, {
+          "Cache-Control": "public, max-age=300",
+        });
+      }
+      // --- MCP endpoint (protected resource) ---
       if (url.pathname === "/mcp") {
-        if (request.method === "POST") return handleMcp(db, request);
+        if (request.method === "POST") return handleMcp(db, request, env);
         return jsonResponse(rpcError(null, -32600, "Method not allowed"), 405);
       }
       if (url.pathname === "/trigger" && request.method === "POST") {

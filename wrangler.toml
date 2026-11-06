@@ -19,6 +19,21 @@ new_sqlite_classes = ["Store"]
 #                 (also stored in
 #                  ~/workspace/goals/reason-network/hidden_files/dots-events-trigger-key.txt)
 #
+# Plain vars (optional; defaults shown):
+#   IDP_ISSUER    = "https://id.0g0.xyz"  (authorization server, 0g0-id)
+#   JWKS_URI      = "<IDP_ISSUER>/.well-known/jwks.json"
+#   RESOURCE_URI  = this Worker's own /mcp URL (audience required in tokens;
+#                   must match the URI registered in 0g0-id's resource_servers)
+
+[vars]
+# OWNER_SUB: the 0g0-id subject (`sub`) of the single owner allowed to use
+# events/subscribe, events/unsubscribe and the tools; deliveries go only to
+# that owner's subscriptions. The value below is a PLACEHOLDER — set the
+# real value at deploy time (API / dashboard), never commit it. While unset
+# or left as the placeholder, every owner-gated method is rejected
+# (fail closed).
+OWNER_SUB = "REPLACE_WITH_OWNER_SUB_AT_DEPLOY"
+#
 # Test-only plain vars (NOT set in production):
 #   TEST_ECHO=1 and TEST_ECHO_SECRET=<throwaway whsec_> enable POST /test-echo
 #   (signature-checking echo used for self-verification; see README).
