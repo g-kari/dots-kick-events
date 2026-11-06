@@ -99,6 +99,7 @@ audience 検証はこの登録 URI との完全一致で行うため、登録が
 | `events:subscribe` | `events/subscribe`、`events/unsubscribe` |
 | `requests:read` | `list_pending_requests` |
 | `requests:update` | `update_request_status` |
+| `claude:kick` | `kick_claude`（逆方向。Muse への依頼登録） |
 
 - トークンがない・不正・期限切れの `/mcp` 呼び出しは **401** と `WWW-Authenticate: Bearer resource_metadata="…"、scope="…"` を返す。スコープ不足は **403**（単一リクエスト時）と step-up 用の `WWW-Authenticate` を返す（バッチ内では該当メッセージだけ JSON-RPC エラー `-32003`）。
 - 購読はトークンの `sub` に結び付く。別 principal が同じ（URL・名前・引数）で解除しようとしても、購読ID自体が異なるため所有者の購読には届かない（レコード側でも principal 一致を確認する二重防御）。配送対象は認証済み principal の購読のみで、認証導入前の `anonymous` 購読（自己検証用データ）には配送しない。
@@ -124,6 +125,15 @@ audience 検証はこの登録 URI との完全一致で行うため、登録が
 - Webhook の `whsec_` 署名は「この配送が本サーバーから来たこと」の検証であり、元の依頼者の本人確認とは別のもの。この区別はコードコメントにも明記した。
 - 届いた `text` は外部入力（信頼できないデータ）として扱う。payload には受信側の権限や安全制約を変えるフィールドを一切含めない（スキーマは従来どおり `request_id` / `text` / `topic` / `created_at` のみ）。
 
+### 逆方向（Muse への依頼）— 1.3.0 で追加
+
+`kick` が dots を起こすのと対に、dots や外部送信者から **Muse（ユーザーのもう一方のエージェント）へ依頼を届ける**経路。Muse 側に着信経路がない（Tailscale クライアントは外向き専用で、ランタイムへの直接呼び出しもない）ため、こちらも「サーバーに依頼を溜めて受信側が取りに来る」形を取る。依頼レコードは dots 向けとは別キースペース（`creq:`）に保存し、状態は `pending → acknowledged → completed`（共通の rank マージ）。
+
+- **Webhook 受付 `POST /claude-hook`**: Standard Webhooks の HMAC 署名（`CLAUDE_HOOK_SECRET`、タイムスタンプ許容 ±5分）で認証する。webhook を直接 POST できる送信者（ユーザーの PC 上の Hermes、スクリプト等）向け。本文は `{text, topic?, request_id?}` で、重複排除は /trigger と同じ put-if-absent。
+- **ツール `kick_claude`**: dots は任意の webhook を POST できないため、同じ登録を MCP ツールでも行えるようにしたもの。所有者制限の対象で、スコープ `claude:kick` が必要。
+- **Muse 側の取り込み**: Muse のポーラーは秘密情報を扱えないため、件数だけを返す公開エンドポイント `GET /claude-inbox/signal`（`{pending: n}` のみ。ID・本文は含まない）を見て起きるかどうかを決める。本文の取得と状態更新は管理キー（`TRIGGER_KEY`）の `GET /claude-inbox` / `POST /claude-inbox/status` で行う。
+- 届いた `text` は Muse にとって外部入力（信頼できないデータ）であり、dots が受ける依頼と同じ扱いにする。受信側の権限を広げるフィールドは持たない。
+
 ### request_id の重複排除と配送セマンティクス
 
 - `/trigger` に呼び出し側が `request_id` を指定できる（形式: 英数字と `._:-`、最大128文字）。作成は Durable Object 内で原子的な put-if-absent で行うため、再送・同時到着でもレコードは1つしか作られず、二重配送は起きない。重複時は既存レコードの状態を `deduplicated: true` で返す。`request_id` を省略した場合は従来どおりサーバーが採番する。
@@ -134,7 +144,8 @@ audience 検証はこの登録 URI との完全一致で行うため、登録が
 
 | 名前 | 種別 | 用途 |
 |---|---|---|
-| `TRIGGER_KEY` | シークレット（設定済み） | `POST /trigger` の管理キー |
+| `TRIGGER_KEY` | シークレット（設定済み） | `POST /trigger` と `/claude-inbox` 管理エンドポイントのキー |
+| `CLAUDE_HOOK_SECRET` | シークレット（要設定） | `POST /claude-hook`（逆方向 webhook 受付）の `whsec_` HMAC 秘密 |
 | `OWNER_SUB` | 平文変数（要設定） | 所有者の 0g0-id `sub`。下記「所有者制限」参照。**本番値はデプロイ時に設定し、リポジトリには書かない**（`wrangler.toml` の値はプレースホルダ） |
 | `IDP_ISSUER` | 平文変数（任意） | 認可サーバーの issuer。既定 `https://id.0g0.xyz` |
 | `JWKS_URI` | 平文変数（任意） | JWKS の取得先。既定 `<IDP_ISSUER>/.well-known/jwks.json` |
@@ -152,7 +163,7 @@ audience 検証はこの登録 URI との完全一致で行うため、登録が
 
 ### 検証方法
 
-- 自動テスト（ローカル、合成データのみ、本番に触れない）: `npm install` のあと `npm test`（`test/auth.test.mjs`、21件）。Miniflare 上で実 Worker を起動し、合成 ES256 鍵ペアで署名した 0g0-id 形式 JWT とモック JWKS（outboundService で配信）を使い、メタデータ（`authorization_servers` が 0g0-id を指すこと、内蔵 AS のエンドポイントが 404 であること）、無認証 401、不透明トークンの拒否、有効トークンでの接続→購読→署名付き配送→状態照合→解除の通し、署名不正・ペイロード改ざん・期限切れ・誤 `iss`・誤 `aud` の拒否、スコープ不足 403、別 principal による解除の無効化、未認証発火（IdP トークン流用含む）の拒否、`request_id` 重複の単一配送、payload による状態上書きの不可、鍵ローテーションへの追従、改ざん Webhook の拒否、kick スキーマ互換を確認する。セキュリティレビュー対応として、**所有者以外の正規トークン（全スコープ）での購読・照合・更新・解除の拒否と配送の所有者限定、`OWNER_SUB` 未設定時の fail closed、IPv6 プライベートリテラル（loopback／ULA／link-local／IPv4-mapped）の拒否、配送中に届いた状態更新が配送後の保存で巻き戻らないこと、配送と状態・メモ更新を並行に走らせても両方向の競合で配送結果・状態・メモが消えないこと**の回帰テストも含む。GitHub Actions（`.github/workflows/ci.yml`）でも push / pull_request のたびに同じテストスイートを実行する。
+- 自動テスト（ローカル、合成データのみ、本番に触れない）: `npm install` のあと `npm test`（`test/auth.test.mjs` 21件＋`test/claude-inbox.test.mjs` 13件）。Miniflare 上で実 Worker を起動し、合成 ES256 鍵ペアで署名した 0g0-id 形式 JWT とモック JWKS（outboundService で配信）を使い、メタデータ（`authorization_servers` が 0g0-id を指すこと、内蔵 AS のエンドポイントが 404 であること）、無認証 401、不透明トークンの拒否、有効トークンでの接続→購読→署名付き配送→状態照合→解除の通し、署名不正・ペイロード改ざん・期限切れ・誤 `iss`・誤 `aud` の拒否、スコープ不足 403、別 principal による解除の無効化、未認証発火（IdP トークン流用含む）の拒否、`request_id` 重複の単一配送、payload による状態上書きの不可、鍵ローテーションへの追従、改ざん Webhook の拒否、kick スキーマ互換を確認する。セキュリティレビュー対応として、**所有者以外の正規トークン（全スコープ）での購読・照合・更新・解除の拒否と配送の所有者限定、`OWNER_SUB` 未設定時の fail closed、IPv6 プライベートリテラル（loopback／ULA／link-local／IPv4-mapped）の拒否、配送中に届いた状態更新が配送後の保存で巻き戻らないこと、配送と状態・メモ更新を並行に走らせても両方向の競合で配送結果・状態・メモが消えないこと**の回帰テストも含む。GitHub Actions（`.github/workflows/ci.yml`）でも push / pull_request のたびに同じテストスイートを実行する。
 - デプロイ後の実機確認: 保護リソースメタデータが 200 で `authorization_servers` に 0g0-id が入ること、無認証の `initialize` が 401 + `WWW-Authenticate` になること、ChatGPT の接続で 0g0-id のログイン画面に遷移し、認可後に `kick` の購読が作れること。
 
 ## 発火方法（管理用）

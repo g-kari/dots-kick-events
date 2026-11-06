@@ -31,7 +31,7 @@ const RECEIVER_SLOW = "https://receiver.example.test/slow-callback";
 const TRIGGER_KEY = "test-trigger-key";
 const WHSEC = "whsec_" + randomBytes(32).toString("base64");
 const ECHO_SECRET = "whsec_" + randomBytes(32).toString("base64");
-const ALL_SCOPES = "events:read events:subscribe requests:read requests:update";
+const ALL_SCOPES = "events:read events:subscribe requests:read requests:update claude:kick";
 
 const b64url = (buf) =>
   Buffer.from(buf)
