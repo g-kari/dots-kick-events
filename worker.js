@@ -48,6 +48,13 @@
 //                        (default <IDP_ISSUER>/.well-known/jwks.json)
 //   RESOURCE_URI       — optional plain var; audience this resource
 //                        requires (default: this Worker's own /mcp URL)
+//   OWNER_SUB          — plain var; the 0g0-id subject (`sub`) of the one
+//                        owner allowed to use the data-bearing / mutating
+//                        MCP methods (events/subscribe, events/unsubscribe,
+//                        both tools). Deliveries go only to this owner's
+//                        subscriptions. Unset/empty rejects everyone
+//                        (fail closed). The production value is set at
+//                        deploy time; it is never committed to this repo.
 //   TEST_ECHO          — optional plain var; when "1", enables POST /test-echo
 //   TEST_ECHO_SECRET   — optional plain var; throwaway whsec_ used only by /test-echo
 
@@ -206,6 +213,40 @@ export class Store extends DurableObject {
       });
       return Response.json({ created, value: current });
     }
+    if (url.pathname === "/merge-delivery") {
+      // Merge delivery results into the CURRENT record. The caller holds
+      // a snapshot taken before delivery; while delivery was in flight
+      // the receiver may have advanced the record (acknowledged /
+      // completed, notes). Writing the stale snapshot back wholesale
+      // would roll that back, so only the delivery fields are merged
+      // here, atomically: deliveries are appended and the status only
+      // ever advances (pending < delivered < acknowledged < completed).
+      const { key, deliveries, anyOk } = await request.json();
+      let merged = null;
+      await this.ctx.blockConcurrencyWhile(async () => {
+        const raw = await s.get(key);
+        if (raw === undefined) return;
+        const record = JSON.parse(raw);
+        const existing = Array.isArray(record.deliveries)
+          ? record.deliveries
+          : [];
+        record.deliveries = [
+          ...existing,
+          ...(Array.isArray(deliveries) ? deliveries : []),
+        ];
+        const rank = { pending: 0, delivered: 1, acknowledged: 2, completed: 3 };
+        const computed = anyOk ? "delivered" : "pending";
+        if ((rank[record.status] ?? 0) < (rank[computed] ?? 0)) {
+          record.status = computed;
+        }
+        record.updatedAt = new Date().toISOString();
+        await s.put(key, JSON.stringify(record));
+        merged = record;
+      });
+      return merged === null
+        ? new Response(null, { status: 404 })
+        : Response.json(merged);
+    }
     return new Response("not found", { status: 404 });
   }
 }
@@ -255,6 +296,17 @@ function store(env) {
         method: "POST",
         body: JSON.stringify({ key, value }),
       });
+      return r.json();
+    },
+    // Atomically merge delivery results into the current stored record
+    // (see the Store "/merge-delivery" endpoint); returns the merged
+    // record, or null if the key no longer exists.
+    async mergeDelivery(key, deliveries, anyOk) {
+      const r = await stub.fetch("https://store/merge-delivery", {
+        method: "POST",
+        body: JSON.stringify({ key, deliveries, anyOk }),
+      });
+      if (r.status === 404) return null;
       return r.json();
     },
   };
@@ -407,6 +459,73 @@ async function signatureHeader(subscription, msgId, timestampSec, body) {
 // ---------- callback URL validation (SSRF basics) ----------
 // Workers fetch resolves DNS inside Cloudflare's network, so we cannot pin
 // the resolved address; we enforce HTTPS and reject local/private literals.
+
+// Private / non-routable IPv4 ranges, judged by the first two octets.
+function isPrivateIPv4(a, b) {
+  return (
+    a === 0 || a === 10 || a === 127 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 169 && b === 254) ||
+    a >= 224
+  );
+}
+
+// Parse an IPv6 literal (brackets already stripped) into eight 16-bit
+// groups, or null when malformed. A trailing dotted IPv4 tail counts as
+// two groups. WHATWG URL keeps the brackets on IPv6 hostnames
+// ("[::1]"), so callers must strip them first — comparing the bracketed
+// form against "::1" etc. would never match and let loopback through.
+function parseIPv6(host) {
+  let addr = host;
+  if (addr.includes(".")) {
+    const m = addr.match(/(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!m) return null;
+    const n = m.slice(1).map(Number);
+    if (n.some((x) => x > 255)) return null;
+    const hi = ((n[0] << 8) | n[1]).toString(16);
+    const lo = ((n[2] << 8) | n[3]).toString(16);
+    addr = addr.slice(0, addr.length - m[0].length) + hi + ":" + lo;
+  }
+  const parsePieces = (s) => {
+    if (s === "") return [];
+    const out = [];
+    for (const p of s.split(":")) {
+      if (!/^[0-9a-fA-F]{1,4}$/.test(p)) return null;
+      out.push(parseInt(p, 16));
+    }
+    return out;
+  };
+  const halves = addr.split("::");
+  if (halves.length > 2) return null;
+  if (halves.length === 2) {
+    const left = parsePieces(halves[0]);
+    const right = parsePieces(halves[1]);
+    if (left === null || right === null) return null;
+    const missing = 8 - left.length - right.length;
+    if (missing < 1) return null; // "::" must compress at least one group
+    return [...left, ...new Array(missing).fill(0), ...right];
+  }
+  const groups = parsePieces(addr);
+  return groups !== null && groups.length === 8 ? groups : null;
+}
+
+function isPrivateIPv6(groups) {
+  const g = groups;
+  // Loopback ::1 and unspecified ::
+  if (g.every((x, i) => x === (i === 7 ? 1 : 0))) return true;
+  if (g.every((x) => x === 0)) return true;
+  if ((g[0] & 0xfe00) === 0xfc00) return true; // ULA fc00::/7
+  if ((g[0] & 0xffc0) === 0xfe80) return true; // link-local fe80::/10
+  if ((g[0] & 0xff00) === 0xff00) return true; // multicast ff00::/8
+  // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d): judge
+  // the embedded IPv4 address by the IPv4 rules.
+  if (g.slice(0, 5).every((x) => x === 0) && (g[5] === 0xffff || g[5] === 0)) {
+    return isPrivateIPv4(g[6] >> 8, g[6] & 0xff);
+  }
+  return false;
+}
+
 function validateCallbackUrl(raw) {
   let u;
   try {
@@ -420,27 +539,18 @@ function validateCallbackUrl(raw) {
     return "blocked_host";
   const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (v4) {
-    const a = Number(v4[1]);
-    const b = Number(v4[2]);
-    if (
-      a === 0 || a === 10 || a === 127 ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 169 && b === 254) ||
-      a >= 224
-    )
-      return "private_address";
+    if (isPrivateIPv4(Number(v4[1]), Number(v4[2]))) return "private_address";
+    return null;
   }
-  if (host.includes(":")) {
-    if (
-      host === "::1" ||
-      host.startsWith("fe8") || host.startsWith("fe9") ||
-      host.startsWith("fea") || host.startsWith("feb") ||
-      host.startsWith("fc") || host.startsWith("fd") ||
-      host.startsWith("::ffff:")
-    )
-      return "private_address";
+  if (host.startsWith("[") && host.endsWith("]")) {
+    // IPv6 literal: strip the WHATWG brackets, then classify by groups
+    // (loopback, ULA, link-local, IPv4-mapped, ...). Unparseable input
+    // fails closed.
+    const groups = parseIPv6(host.slice(1, -1));
+    if (!groups || isPrivateIPv6(groups)) return "private_address";
+    return null;
   }
+  if (host.includes(":")) return "private_address"; // unbracketed colon host: fail closed
   return null;
 }
 
@@ -661,8 +771,9 @@ async function listRequests(db) {
   return out;
 }
 
-async function deliverToSubscriptions(db, request) {
+async function deliverToSubscriptions(db, request, env) {
   const subs = await listSubscriptions(db);
+  const ownerSub = configuredOwnerSub(env);
   const now = Date.now();
   const results = [];
   for (const sub of subs) {
@@ -670,6 +781,11 @@ async function deliverToSubscriptions(db, request) {
     // Pre-OAuth subscriptions (principal "anonymous" or missing) were
     // self-verification artifacts; they no longer receive deliveries.
     if (!sub.principal || sub.principal === LEGACY_PRINCIPAL) continue;
+    // Deliveries go only to the configured owner's subscriptions. A
+    // subscription record belonging to any other principal (e.g. created
+    // before the owner restriction existed) must not receive request
+    // payloads. OWNER_SUB unset means no deliveries at all (fail closed).
+    if (!ownerSub || sub.principal !== ownerSub) continue;
     if (sub.refreshBefore && Date.parse(sub.refreshBefore) <= now) continue;
     const filterTopic = sub.arguments?.topic;
     if (filterTopic && request.topic && filterTopic !== request.topic) continue;
@@ -961,6 +1077,35 @@ async function handleToolsCall(db, id, params) {
 
 // ---------- MCP endpoint (protected resource) ----------
 
+// ---------- owner restriction ----------
+// This is a single-owner personal service. A valid token proves *some*
+// IdP user completed the authorization flow for this resource — it does
+// not make them the owner. The data-bearing / mutating methods
+// (events/subscribe, events/unsubscribe, and both tools) additionally
+// require the token subject to equal OWNER_SUB. OWNER_SUB unset or empty
+// rejects everyone (fail closed), so a deployment that forgets the
+// setting exposes nothing. Public metadata and the read-only discovery
+// methods (initialize, server/discover, ping, tools/list, events/list)
+// are unchanged: they carry no request data.
+function configuredOwnerSub(env) {
+  const v = env && env.OWNER_SUB;
+  return typeof v === "string" && v ? v : null;
+}
+
+function requiresOwner(msg) {
+  const { method } = msg || {};
+  return (
+    method === "events/subscribe" ||
+    method === "events/unsubscribe" ||
+    method === "tools/call"
+  );
+}
+
+function isOwner(env, auth) {
+  const owner = configuredOwnerSub(env);
+  return owner !== null && auth !== null && auth.principal === owner;
+}
+
 // Scope required per JSON-RPC method (null = any valid token). tools/call is
 // resolved per tool name.
 function requiredScope(msg) {
@@ -1052,6 +1197,19 @@ async function handleMcp(db, request, env) {
             scope: [need],
           }),
         });
+      }
+      responses.push(errBody);
+      continue;
+    }
+    if (requiresOwner(msg) && !isOwner(env, auth)) {
+      const errBody = rpcError(
+        msg?.id ?? null,
+        -32001,
+        "forbidden: caller is not the resource owner",
+        { error: "forbidden" }
+      );
+      if (!Array.isArray(parsed)) {
+        return jsonResponse(errBody, 403);
       }
       responses.push(errBody);
       continue;
@@ -1154,15 +1312,21 @@ async function handleTrigger(env, db, request) {
     await db.put("req:" + record.id, JSON.stringify(record));
   }
 
-  const results = await deliverToSubscriptions(db, record);
-  record.deliveries = results;
-  if (results.some((r) => r.ok)) record.status = "delivered";
-  record.updatedAt = new Date().toISOString();
-  await db.put("req:" + record.id, JSON.stringify(record));
+  const results = await deliverToSubscriptions(db, record, env);
+  // Merge the outcome into the latest stored record inside the DO: a
+  // status update (acknowledged / completed, with notes) may have landed
+  // while delivery was in flight, and writing this handler's pre-delivery
+  // snapshot back would roll it back to "delivered" and drop the notes.
+  const merged = await db.mergeDelivery(
+    "req:" + record.id,
+    results,
+    results.some((r) => r.ok)
+  );
+  const final = merged || record;
 
   return jsonResponse({
     request_id: record.id,
-    status: record.status,
+    status: final.status,
     deduplicated: false,
     subscriptions_matched: results.length,
     delivered: results.filter((r) => r.ok).length,

@@ -36,7 +36,7 @@ MCP エンドポイント `POST /mcp`（JSON-RPC 2.0）:
 
 1. イベント名・引数を定義と照合。未知のフィルタ引数は `-32602`。
 2. `delivery.secret` が `whsec_` 形式で Base64 デコード後 24–64 バイトであることを検証。
-3. コールバックURLは HTTPS 必須。localhost／プライベートIPリテラル等を拒否（拒否時は `-32015`）。
+3. コールバックURLは HTTPS 必須。localhost／プライベートIPリテラル等を拒否（拒否時は `-32015`）。IPv6 リテラルは WHATWG URL が付ける角括弧を除去してからグループ単位で分類し、loopback（`::1`）・ULA（`fc00::/7`）・link-local（`fe80::/10`）・IPv4-mapped（埋め込み IPv4 を IPv4 ルールで判定）を拒否する。
 4. 購読IDは principal（認証トークンの主体。下記「認証（OAuth 2.1）」参照）＋コールバックURL＋イベント名＋引数の canonical JSON から決定的に導出。同一IDなら更新（冪等）。購読レコードにも principal を保存し、他人の購読は参照・解除できない。
 5. 保存前に、署名付きの検証リクエスト `{"type":"verification","challenge":...}` をコールバックへ送り、2xx かつチャレンジの一致を確認。失敗時は JSON-RPC エラー `-32015`（`data.reason`: `challenge_failed` / `timeout` など）。検証成功は principal＋URL 単位で24時間キャッシュし、再購読時の再チャレンジを省略。
 6. 有効期限: `ttlMs` 省略時は7日、`ttlMs` 指定時は最小1時間・最大30日にクランプ、`ttlMs: null`（無期限要求）でも有限の期限を返す。結果に `refreshBefore` を含める（`cursor: null`、`truncated: false`）。
@@ -103,6 +103,15 @@ audience 検証はこの登録 URI との完全一致で行うため、登録が
 - トークンがない・不正・期限切れの `/mcp` 呼び出しは **401** と `WWW-Authenticate: Bearer resource_metadata="…"、scope="…"` を返す。スコープ不足は **403**（単一リクエスト時）と step-up 用の `WWW-Authenticate` を返す（バッチ内では該当メッセージだけ JSON-RPC エラー `-32003`）。
 - 購読はトークンの `sub` に結び付く。別 principal が同じ（URL・名前・引数）で解除しようとしても、購読ID自体が異なるため所有者の購読には届かない（レコード側でも principal 一致を確認する二重防御）。配送対象は認証済み principal の購読のみで、認証導入前の `anonymous` 購読（自己検証用データ）には配送しない。
 
+### 所有者制限（OWNER_SUB）
+
+本サーバーは個人用のため、**「有効なトークンを持っている」だけでは依頼データに触れない**。スコープに加えて、データを扱うメソッド（`events/subscribe`、`events/unsubscribe`、ツール2種）はトークンの `sub` が平文変数 `OWNER_SUB`（所有者の 0g0-id `sub`）と一致することを要求し、不一致は **403**（JSON-RPC エラー `-32001`、`error: "forbidden"`）で拒否する。
+
+- `OWNER_SUB` が**未設定・空の場合は全員を拒否**する（fail closed）。設定忘れで公開状態にはならない。
+- 配送は `OWNER_SUB` の購読にのみ行う。制限導入前に作られた他人の購読レコードが残っていても配送されない。
+- `initialize` / `server/discover` / `ping` / `tools/list` / `events/list` と保護リソースメタデータは従来どおり（依頼データを含まないため）。
+- 本番の `OWNER_SUB` の値はデプロイ時に API／ダッシュボードで設定する。リポジトリ内の `wrangler.toml` にはプレースホルダのみを置く。
+
 ### クライアント登録（ChatGPT 側の接続に必要）
 
 - **DCR（動的登録）**: 0g0-id の `POST /api/register`（RFC 7591）。ChatGPT のような MCP クライアントが公開クライアント（`token_endpoint_auth_method: "none"` ＋ PKCE S256）として自己登録できる。redirect URI は https 必須（localhost の http は開発用に許可）。初期アクセストークンは不要。
@@ -119,12 +128,14 @@ audience 検証はこの登録 URI との完全一致で行うため、登録が
 
 - `/trigger` に呼び出し側が `request_id` を指定できる（形式: 英数字と `._:-`、最大128文字）。作成は Durable Object 内で原子的な put-if-absent で行うため、再送・同時到着でもレコードは1つしか作られず、二重配送は起きない。重複時は既存レコードの状態を `deduplicated: true` で返す。`request_id` を省略した場合は従来どおりサーバーが採番する。
 - Webhook の 2xx は「受信確認」であって「作業完了」ではない。完了は従来どおり `update_request_status` の `completed` で表す。配送リトライでは `eventId`（依頼ID＋購読IDから決定的に生成）を変えないため、受信側でも重複排除できる。各試行では署名タイムスタンプを更新する。受信側は署名検証に加え、タイムスタンプの許容範囲（Standard Webhooks の作法では5分程度）と `eventId` の重複チェックでリプレイに備えること。
+- 配送結果の保存は Durable Object 内で最新レコードへのマージとして行う（配送結果フィールドの追記と、状態の前進のみ）。配送中に受信側が `acknowledged` / `completed` やメモを更新しても、配送後の保存で巻き戻ることはない。
 
 ### 環境変数・シークレット（名前のみ。値はリポジトリに書かない）
 
 | 名前 | 種別 | 用途 |
 |---|---|---|
 | `TRIGGER_KEY` | シークレット（設定済み） | `POST /trigger` の管理キー |
+| `OWNER_SUB` | 平文変数（要設定） | 所有者の 0g0-id `sub`。下記「所有者制限」参照。**本番値はデプロイ時に設定し、リポジトリには書かない**（`wrangler.toml` の値はプレースホルダ） |
 | `IDP_ISSUER` | 平文変数（任意） | 認可サーバーの issuer。既定 `https://id.0g0.xyz` |
 | `JWKS_URI` | 平文変数（任意） | JWKS の取得先。既定 `<IDP_ISSUER>/.well-known/jwks.json` |
 | `RESOURCE_URI` | 平文変数（任意） | audience の期待値。既定は自オリジン + `/mcp`。0g0-id 側の登録 URI と一致させること |
@@ -141,7 +152,7 @@ audience 検証はこの登録 URI との完全一致で行うため、登録が
 
 ### 検証方法
 
-- 自動テスト（ローカル、合成データのみ、本番に触れない）: `npm install` のあと `npm test`（`test/auth.test.mjs`、16件）。Miniflare 上で実 Worker を起動し、合成 ES256 鍵ペアで署名した 0g0-id 形式 JWT とモック JWKS（outboundService で配信）を使い、メタデータ（`authorization_servers` が 0g0-id を指すこと、内蔵 AS のエンドポイントが 404 であること）、無認証 401、不透明トークンの拒否、有効トークンでの接続→購読→署名付き配送→状態照合→解除の通し、署名不正・ペイロード改ざん・期限切れ・誤 `iss`・誤 `aud` の拒否、スコープ不足 403、別 principal による解除の無効化、未認証発火（IdP トークン流用含む）の拒否、`request_id` 重複の単一配送、payload による状態上書きの不可、鍵ローテーションへの追従、改ざん Webhook の拒否、kick スキーマ互換を確認する。
+- 自動テスト（ローカル、合成データのみ、本番に触れない）: `npm install` のあと `npm test`（`test/auth.test.mjs`、20件）。Miniflare 上で実 Worker を起動し、合成 ES256 鍵ペアで署名した 0g0-id 形式 JWT とモック JWKS（outboundService で配信）を使い、メタデータ（`authorization_servers` が 0g0-id を指すこと、内蔵 AS のエンドポイントが 404 であること）、無認証 401、不透明トークンの拒否、有効トークンでの接続→購読→署名付き配送→状態照合→解除の通し、署名不正・ペイロード改ざん・期限切れ・誤 `iss`・誤 `aud` の拒否、スコープ不足 403、別 principal による解除の無効化、未認証発火（IdP トークン流用含む）の拒否、`request_id` 重複の単一配送、payload による状態上書きの不可、鍵ローテーションへの追従、改ざん Webhook の拒否、kick スキーマ互換を確認する。セキュリティレビュー対応として、**所有者以外の正規トークン（全スコープ）での購読・照合・更新・解除の拒否と配送の所有者限定、`OWNER_SUB` 未設定時の fail closed、IPv6 プライベートリテラル（loopback／ULA／link-local／IPv4-mapped）の拒否、配送中に届いた状態更新が配送後の保存で巻き戻らないこと**の回帰テストも含む。
 - デプロイ後の実機確認: 保護リソースメタデータが 200 で `authorization_servers` に 0g0-id が入ること、無認証の `initialize` が 401 + `WWW-Authenticate` になること、ChatGPT の接続で 0g0-id のログイン画面に遷移し、認可後に `kick` の購読が作れること。
 
 ## 発火方法（管理用）
@@ -180,7 +191,7 @@ curl -X POST https://dots-events.0g0.xyz/trigger \
 ### OAuth 対応の検証（2026-11-06、ローカル自動テスト）
 
 - 初版（内蔵認可サーバー方式）: Miniflare 上の自動テスト12件合格。その後、方式変更に伴いテストも作り替えた。
-- 現行（0g0-id 方式）: `test/auth.test.mjs` の **16件が全件合格**（内容は「認証（OAuth 2.1）＞検証方法」参照）。0g0-id はモック JWKS ＋合成鍵で模擬し、本番 IdP・本番サーバーにはアクセスしていない。
+- 現行（0g0-id 方式）: `test/auth.test.mjs` の **20件が全件合格**（内容は「認証（OAuth 2.1）＞検証方法」参照。うち4件はセキュリティレビュー指摘への回帰テスト）。0g0-id はモック JWKS ＋合成鍵で模擬し、本番 IdP・本番サーバーにはアクセスしていない。
 - 本番に対して行った確認は読み取りのみ: 無認証の `initialize` / `events/list` / `tools/list` が成功すること（＝現行本番はオープンな原初ビルド）、保護リソースメタデータが 404 であることを確認済み。本番での購読作成・削除・発火は行っていない。
 - 未実施: 前提（0g0-id 側 PR・登録）が揃った後の、ChatGPT 実機での認可フローと購読認識の確認。
 

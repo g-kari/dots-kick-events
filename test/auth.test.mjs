@@ -27,6 +27,7 @@ const ORIGIN = "https://dots-events.test";
 const RESOURCE = ORIGIN + "/mcp";
 const ISSUER = "https://idp.example.test";
 const RECEIVER = "https://receiver.example.test/callback";
+const RECEIVER_SLOW = "https://receiver.example.test/slow-callback";
 const TRIGGER_KEY = "test-trigger-key";
 const WHSEC = "whsec_" + randomBytes(32).toString("base64");
 const ECHO_SECRET = "whsec_" + randomBytes(32).toString("base64");
@@ -93,7 +94,7 @@ async function outboundService(req) {
   if (req.url === ISSUER + "/.well-known/jwks.json") {
     return Response.json({ keys: jwksKeys });
   }
-  if (req.url.startsWith(RECEIVER)) {
+  if (req.url.startsWith(RECEIVER) || req.url.startsWith(RECEIVER_SLOW)) {
     const sigValid = verifyStdWebhook(
       WHSEC,
       req.headers.get("webhook-id"),
@@ -117,6 +118,11 @@ async function outboundService(req) {
       signatureValid: sigValid,
       body: parsed,
     });
+    if (req.url.startsWith(RECEIVER_SLOW)) {
+      // Hold the response back so a test can act while a delivery is
+      // still in flight (delivery/status race regression test).
+      await new Promise((r) => setTimeout(r, 800));
+    }
     return Response.json({ ok: true });
   }
   return new Response("not found", { status: 404 });
@@ -133,6 +139,7 @@ before(async () => {
       TRIGGER_KEY,
       IDP_ISSUER: ISSUER,
       RESOURCE_URI: RESOURCE,
+      OWNER_SUB: "user-1",
       TEST_ECHO: "1",
       TEST_ECHO_SECRET: ECHO_SECRET,
     },
@@ -400,9 +407,12 @@ test("another principal cannot remove someone else's subscription", async () => 
     },
     stranger
   );
-  assert.equal(attempt.status, 200); // idempotent response...
+  // Non-owner callers are now rejected outright by the owner restriction
+  // (previously this returned an idempotent 200 without deleting anything).
+  assert.equal(attempt.status, 403);
+  assert.equal(attempt.json.error.data.error, "forbidden");
 
-  const before = deliveries.length; // ...but the subscription must still fire
+  const before = deliveries.length; // and the subscription must still fire
   const fired = await trigger({ text: "所有者確認", request_id: "req-owner-1" });
   assert.equal(fired.json.delivered, 1);
   assert.equal(deliveries.length, before + 1);
@@ -506,4 +516,260 @@ test("/test-echo accepts correctly signed webhooks and rejects tampered ones", a
     body: body + " ", // tampered
   });
   assert.equal(badRes.status, 403);
+});
+
+// ---------------- owner restriction (security review #1) ----------------
+
+test("non-owner principal (valid JWT, all scopes) is rejected from subscribe/read/update/unsubscribe and receives no deliveries", async () => {
+  const stranger = mintJwt(key1, { sub: "user-2" });
+
+  const sub = await subscribeCall(stranger);
+  assert.equal(sub.status, 403);
+  assert.equal(sub.json.error.data.error, "forbidden");
+
+  const list = await rpc(
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "list_pending_requests", arguments: {} } },
+    stranger
+  );
+  assert.equal(list.status, 403);
+  assert.equal(list.json.error.data.error, "forbidden");
+
+  const upd = await rpc(
+    {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "update_request_status", arguments: { request_id: "req-flow-1", status: "completed" } },
+    },
+    stranger
+  );
+  assert.equal(upd.status, 403);
+  assert.equal(upd.json.error.data.error, "forbidden");
+
+  const unsub = await rpc(
+    {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "events/unsubscribe",
+      params: { name: "kick", arguments: {}, delivery: { mode: "webhook", url: RECEIVER } },
+    },
+    stranger
+  );
+  assert.equal(unsub.status, 403);
+
+  // Read-only discovery still works for any valid token.
+  const events = await rpc({ jsonrpc: "2.0", id: 5, method: "events/list", params: {} }, stranger);
+  assert.equal(events.status, 200);
+
+  // Deliveries: seed two subscription records directly in the store — one
+  // owned by a stranger, one by the owner — as if they predated the owner
+  // restriction. Only the owner's may receive the payload.
+  const ns = await mf.getDurableObjectNamespace("STORE");
+  const stub = ns.get(ns.idFromName("global"));
+  const seed = async (id, principal) => {
+    await stub.fetch("https://store/put", {
+      method: "POST",
+      body: JSON.stringify({
+        key: "sub:" + id,
+        value: JSON.stringify({
+          id,
+          principal,
+          name: "kick",
+          arguments: {},
+          callbackUrl: RECEIVER,
+          secret: WHSEC,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          refreshBefore: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          verifiedAt: new Date().toISOString(),
+          verifiedUntil: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        }),
+      }),
+    });
+  };
+  await seed("sub_foreign_seed", "user-2");
+  await seed("sub_owner_seed", "user-1");
+  const beforeCount = deliveries.length;
+  const fired = await trigger({ text: "所有者にだけ届く", request_id: "req-owner-only-1" });
+  // Exactly one match proves the seeded records were seen by the delivery
+  // loop and the stranger's was filtered out.
+  assert.equal(fired.json.subscriptions_matched, 1);
+  assert.equal(fired.json.delivered, 1);
+  const fresh = deliveries.slice(beforeCount);
+  assert.equal(fresh.length, 1);
+  assert.equal(fresh[0].subscriptionId, "sub_owner_seed");
+
+  for (const id of ["sub_foreign_seed", "sub_owner_seed"]) {
+    await stub.fetch("https://store/delete", {
+      method: "POST",
+      body: JSON.stringify({ key: "sub:" + id }),
+    });
+  }
+});
+
+test("OWNER_SUB unset fails closed: owner-gated methods are rejected even for the would-be owner", async () => {
+  const mf2 = new Miniflare({
+    modules: true,
+    scriptPath: new URL("../worker.js", import.meta.url).pathname,
+    compatibilityDate: "2025-11-01",
+    durableObjects: { STORE: "Store" },
+    bindings: {
+      TRIGGER_KEY,
+      IDP_ISSUER: ISSUER,
+      RESOURCE_URI: RESOURCE,
+      // OWNER_SUB intentionally unset.
+      TEST_ECHO: "1",
+      TEST_ECHO_SECRET: ECHO_SECRET,
+    },
+    outboundService,
+  });
+  try {
+    await mf2.ready;
+    const token = mintJwt(key1); // sub user-1, all scopes, valid signature
+    const call = async (payload) => {
+      const res = await mf2.dispatchFetch(ORIGIN + "/mcp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+        body: JSON.stringify(payload),
+      });
+      return { status: res.status, json: JSON.parse(await res.text()) };
+    };
+    // The token itself is valid and discovery is unchanged...
+    const init = await call({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    assert.equal(init.status, 200);
+    // ...but with no owner configured, nobody is the owner.
+    const sub = await call({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "events/subscribe",
+      params: { name: "kick", arguments: {}, delivery: { mode: "webhook", url: RECEIVER, secret: WHSEC } },
+    });
+    assert.equal(sub.status, 403);
+    assert.equal(sub.json.error.data.error, "forbidden");
+    const list = await call({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "list_pending_requests", arguments: {} },
+    });
+    assert.equal(list.status, 403);
+  } finally {
+    await mf2.dispose();
+  }
+});
+
+// ---------------- callback URL IPv6 classification (security review #2) ----------------
+
+test("private IPv6 callback literals are rejected; public ones pass address validation", async () => {
+  const token = mintJwt(key1);
+  const subscribeTo = (url) =>
+    rpc(
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "events/subscribe",
+        params: { name: "kick", arguments: {}, delivery: { mode: "webhook", url, secret: WHSEC } },
+      },
+      token
+    );
+  const blocked = [
+    "https://[::1]/cb", // loopback
+    "https://[::]/cb", // unspecified
+    "https://[fc00::1]/cb", // ULA fc00::/7
+    "https://[fd12:3456::1]/cb", // ULA
+    "https://[fe80::1]/cb", // link-local fe80::/10
+    "https://[febf::ffff]/cb", // link-local, top of the range
+    "https://[::ffff:127.0.0.1]/cb", // IPv4-mapped loopback (dotted form)
+    "https://[::ffff:7f00:1]/cb", // IPv4-mapped loopback (hex form)
+    "https://[::ffff:10.0.0.5]/cb", // IPv4-mapped RFC1918
+    "https://[::ffff:192.168.0.1]/cb", // IPv4-mapped RFC1918
+  ];
+  for (const url of blocked) {
+    const res = await subscribeTo(url);
+    assert.equal(res.json?.error?.code, -32015, url);
+    assert.equal(res.json?.error?.data?.reason, "private_address", url);
+  }
+  // Public literals pass address validation and only fail later, at the
+  // challenge step (the stub 404s unknown hosts) — never private_address.
+  for (const url of ["https://[2606:4700:4700::1111]/cb", "https://[::ffff:8.8.8.8]/cb"]) {
+    const res = await subscribeTo(url);
+    assert.equal(res.json?.error?.code, -32015, url);
+    assert.equal(res.json?.error?.data?.reason, "challenge_failed", url);
+  }
+});
+
+// ---------------- delivery/status race (security review #3) ----------------
+
+test("a status update landing during delivery is not rolled back by the delivery write", async () => {
+  const token = mintJwt(key1);
+  const sub = await rpc(
+    {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "events/subscribe",
+      params: { name: "kick", arguments: {}, delivery: { mode: "webhook", url: RECEIVER_SLOW, secret: WHSEC } },
+    },
+    token
+  );
+  assert.equal(sub.status, 200, JSON.stringify(sub.json));
+
+  const firedPromise = trigger({ text: "配送中に状態が進む", request_id: "req-race-1" });
+  // Wait until the delivery request has reached the receiver; the stub
+  // holds its response back, so the trigger is still mid-delivery.
+  for (let i = 0; i < 200; i++) {
+    if (deliveries.some((d) => d.body?.data?.request_id === "req-race-1")) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.ok(deliveries.some((d) => d.body?.data?.request_id === "req-race-1"));
+
+  // dots acknowledges (with a note) before the delivery completes.
+  const upd = await rpc(
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "update_request_status",
+        arguments: { request_id: "req-race-1", status: "acknowledged", note: "配送中に着手" },
+      },
+    },
+    token
+  );
+  assert.equal(JSON.parse(upd.json.result.content[0].text).status, "acknowledged");
+
+  const fired = await firedPromise;
+  assert.equal(fired.status, 200);
+  assert.equal(fired.json.delivered, 1);
+
+  const list = await rpc(
+    { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_pending_requests", arguments: {} } },
+    token
+  );
+  const found = JSON.parse(list.json.result.content[0].text).requests.find(
+    (r) => r.id === "req-race-1"
+  );
+  assert.equal(found.status, "acknowledged"); // not rolled back to "delivered"
+  assert.equal(found.deliveries.length, 1); // delivery result still merged in
+  assert.equal(found.deliveries[0].ok, true);
+  assert.ok((found.notes || []).some((n) => n.note === "配送中に着手"));
+
+  // cleanup
+  await rpc(
+    {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "update_request_status", arguments: { request_id: "req-race-1", status: "completed" } },
+    },
+    token
+  );
+  await rpc(
+    {
+      jsonrpc: "2.0",
+      id: 5,
+      method: "events/unsubscribe",
+      params: { name: "kick", arguments: {}, delivery: { mode: "webhook", url: RECEIVER_SLOW } },
+    },
+    token
+  );
 });
