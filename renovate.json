@@ -16,5 +16,6 @@
       "matchCurrentVersion": "!/^0/",
       "automerge": true
     }
-  ]
+  ],
+  "minimumReleaseAge": "1 day"
 }
