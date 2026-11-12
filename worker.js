@@ -66,13 +66,19 @@ import { DurableObject } from "cloudflare:workers";
 
 const EVENT_NAME = "kick";
 const SERVER_NAME = "dots-kick-events";
-const SERVER_VERSION = "1.3.0";
+const SERVER_VERSION = "1.4.0";
 const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MIN_TTL_MS = 60 * 60 * 1000; // 1 hour
 const MAX_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const VERIFY_CACHE_MS = 24 * 60 * 60 * 1000; // 24 hours
 const PREV_SECRET_WINDOW_MS = 10 * 60 * 1000; // sign with old+new key briefly after rotation
 const MAX_BODY_BYTES = 256 * 1024;
+// How long a delivery claim (see the Store "/delivery-claim" endpoint)
+// blocks other drives of the same (request, subscription) pair. One
+// pair's full retry sequence is bounded by 3 attempts with a 10s fetch
+// timeout each plus 0.5s/1.5s backoff (~32s worst case); the lease
+// leaves headroom over that.
+const DELIVERY_CLAIM_LEASE_MS = 45 * 1000;
 
 // ---------- OAuth constants (resource server) ----------
 
@@ -309,6 +315,97 @@ export class Store extends DurableObject {
         ? new Response(null, { status: 404 })
         : Response.json(merged);
     }
+    if (url.pathname === "/delivery-claim") {
+      // Atomically claim the right to deliver one (request, subscription)
+      // pair, or report that this pair must not be POSTed again. The
+      // ledger lives in this object's persistent storage (key
+      // "dlv:<requestId>", a JSON map subscriptionId -> entry), so the
+      // decision survives Worker restarts and client reconnects; it is
+      // never an in-memory check in the Worker.
+      //
+      // Entry lifecycle:
+      //   (absent)   -> claim granted; entry becomes "attempting".
+      //   "delivered" -> skip (already_delivered). This pair's webhook
+      //     was acknowledged 2xx by an earlier drive and the outcome was
+      //     settled into the ledger — even if the caller of that drive
+      //     never saw the result (lost response, killed invocation).
+      //   "attempting", claimed within the lease -> skip (inflight):
+      //     another drive is delivering this pair right now.
+      //   "attempting", lease expired -> the claiming invocation died
+      //     before settling. Whether its POST reached the receiver is
+      //     unknowable here, so the claim is taken over and delivery is
+      //     retried; the deterministic eventId (sent as the webhook-id
+      //     header) is unchanged, so a receiver that did get the first
+      //     POST can dedupe the retry.
+      //   "failed" -> the previous drive reached a definitive
+      //     non-delivery outcome (non-2xx answer or a transport error);
+      //     a new claim is granted. This is what lets a re-sent
+      //     /trigger finish a request whose first drive failed.
+      const { key, subscriptionId, eventId, leaseMs } = await request.json();
+      let verdict = null;
+      await this.ctx.blockConcurrencyWhile(async () => {
+        const raw = await s.get(key);
+        const ledger = raw === undefined ? {} : JSON.parse(raw);
+        const now = Date.now();
+        const entry = ledger[subscriptionId];
+        if (entry && entry.state === "delivered") {
+          verdict = { action: "skip", reason: "already_delivered", entry };
+          return;
+        }
+        if (
+          entry &&
+          entry.state === "attempting" &&
+          typeof entry.claimedAtMs === "number" &&
+          now - entry.claimedAtMs < leaseMs
+        ) {
+          verdict = { action: "skip", reason: "inflight", entry };
+          return;
+        }
+        const next = {
+          state: "attempting",
+          eventId,
+          attempts:
+            (entry && typeof entry.attempts === "number" ? entry.attempts : 0) + 1,
+          claimedAt: new Date(now).toISOString(),
+          claimedAtMs: now,
+          lastStatus: entry ? (entry.lastStatus ?? null) : null,
+        };
+        ledger[subscriptionId] = next;
+        await s.put(key, JSON.stringify(ledger));
+        verdict = { action: "deliver", entry: next };
+      });
+      return Response.json(verdict);
+    }
+    if (url.pathname === "/delivery-settle") {
+      // Record the outcome of a delivery claim. ok=true marks the pair
+      // "delivered"; ok=false marks it "failed" (a later drive may
+      // retry it). The caller passes the attempts count of its claim;
+      // a settle whose count no longer matches the stored entry is a
+      // late arrival from a superseded claim and is ignored, so it
+      // cannot overwrite the state of the claim that took over.
+      const { key, subscriptionId, attempts, ok, status } = await request.json();
+      let outcome = null;
+      await this.ctx.blockConcurrencyWhile(async () => {
+        const raw = await s.get(key);
+        if (raw === undefined) return;
+        const ledger = JSON.parse(raw);
+        const current = ledger[subscriptionId];
+        if (!current) return;
+        if (typeof attempts === "number" && current.attempts !== attempts) {
+          outcome = { entry: current, applied: false };
+          return;
+        }
+        current.state = ok ? "delivered" : "failed";
+        current.lastStatus = status ?? null;
+        current.settledAt = new Date().toISOString();
+        ledger[subscriptionId] = current;
+        await s.put(key, JSON.stringify(ledger));
+        outcome = { entry: current, applied: true };
+      });
+      return outcome === null
+        ? new Response(null, { status: 404 })
+        : Response.json(outcome);
+    }
     return new Response("not found", { status: 404 });
   }
 }
@@ -378,6 +475,38 @@ function store(env) {
       const r = await stub.fetch("https://store/merge-status", {
         method: "POST",
         body: JSON.stringify({ key, status, note: note ?? null }),
+      });
+      if (r.status === 404) return null;
+      return r.json();
+    },
+    // Atomically claim one (request, subscription) pair in the
+    // persistent delivery ledger (see the Store "/delivery-claim"
+    // endpoint); returns { action: "deliver" | "skip", reason?, entry }.
+    async claimDelivery(requestId, subscriptionId, eventId) {
+      const r = await stub.fetch("https://store/delivery-claim", {
+        method: "POST",
+        body: JSON.stringify({
+          key: "dlv:" + requestId,
+          subscriptionId,
+          eventId,
+          leaseMs: DELIVERY_CLAIM_LEASE_MS,
+        }),
+      });
+      return r.json();
+    },
+    // Record the outcome of a claimed delivery pair (see the Store
+    // "/delivery-settle" endpoint). `attempts` is the claim's attempts
+    // count, used by the object to ignore superseded settles.
+    async settleDelivery(requestId, subscriptionId, attempts, ok, status) {
+      const r = await stub.fetch("https://store/delivery-settle", {
+        method: "POST",
+        body: JSON.stringify({
+          key: "dlv:" + requestId,
+          subscriptionId,
+          attempts,
+          ok,
+          status: status ?? null,
+        }),
       });
       if (r.status === 404) return null;
       return r.json();
@@ -905,6 +1034,28 @@ async function deliverToSubscriptions(db, request, env) {
       cursor: null,
     });
 
+    // Idempotency gate: before POSTing, claim this (request,
+    // subscription) pair in the persistent delivery ledger inside the
+    // Durable Object. A pair whose delivery already succeeded — or
+    // that another in-flight drive is delivering right now — is
+    // skipped, so re-driving delivery for a request (a re-sent
+    // /trigger, a caller retrying after its response was lost) can
+    // never POST the same kick to the same subscription twice.
+    const claim = await db.claimDelivery(request.id, sub.id, eventId);
+    if (claim.action === "skip") {
+      results.push({
+        subscriptionId: sub.id,
+        eventId,
+        ok: claim.reason === "already_delivered",
+        status: claim.entry ? (claim.entry.lastStatus ?? null) : null,
+        attempts: claim.entry ? (claim.entry.attempts ?? 0) : 0,
+        deduplicated: true,
+        deduplicatedReason: claim.reason,
+        at: new Date().toISOString(),
+      });
+      continue;
+    }
+
     let ok = false;
     let status = null;
     let attempts = 0;
@@ -922,6 +1073,16 @@ async function deliverToSubscriptions(db, request, env) {
         await new Promise((r) => setTimeout(r, attempt === 0 ? 500 : 1500));
       }
     }
+    // Settle the claim with the outcome before reporting it: from
+    // here on, the ledger — not this invocation's memory — is what
+    // stops a re-drive from repeating this POST.
+    await db.settleDelivery(
+      request.id,
+      sub.id,
+      claim.entry ? claim.entry.attempts : attempts,
+      ok,
+      status
+    );
     results.push({
       subscriptionId: sub.id,
       eventId,
@@ -1367,9 +1528,13 @@ async function handleMcp(db, request, env) {
 //
 // Replay / duplication: callers may supply their own request_id. Creation is
 // atomic (put-if-absent in the Durable Object), so a re-sent trigger — even
-// two copies arriving at the same time — returns the existing record and
-// never delivers twice. (Without a supplied request_id, each call creates
-// a fresh server-generated ID, as before.)
+// two copies arriving at the same time — maps to exactly one record.
+// Delivery itself is idempotent per (request, subscription) pair via the
+// persistent delivery ledger (see deliverToSubscriptions): a duplicate
+// trigger for a still-pending request re-drives only the pairs whose
+// delivery has not already succeeded, and never re-POSTs a delivered
+// pair. (Without a supplied request_id, each call creates a fresh
+// server-generated ID, as before.)
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 async function handleTrigger(env, db, request) {
@@ -1426,6 +1591,35 @@ async function handleTrigger(env, db, request) {
   );
   if (!created) {
     const existing = JSON.parse(value);
+    // Re-drive: a duplicate /trigger for a request that is still
+    // "pending" means no successful delivery outcome was ever merged
+    // for it — the first caller's connection was cut, this endpoint's
+    // response was lost, the first drive died mid-flight, or every
+    // attempt failed. Drive delivery again; the persistent delivery
+    // ledger makes deliverToSubscriptions skip the pairs that are
+    // already delivered (or in flight), so the re-drive completes the
+    // request without duplicating any kick.
+    if (existing.status === "pending") {
+      const results = await deliverToSubscriptions(db, existing, env);
+      if (results.length > 0) {
+        const merged = await db.mergeDelivery(
+          "req:" + existing.id,
+          results.filter((r) => !r.deduplicated),
+          results.some((r) => r.ok)
+        );
+        const final = merged || existing;
+        const deliveries = Array.isArray(final.deliveries)
+          ? final.deliveries
+          : [];
+        return jsonResponse({
+          request_id: final.id,
+          status: final.status,
+          deduplicated: true,
+          subscriptions_matched: deliveries.length,
+          delivered: deliveries.filter((r) => r.ok).length,
+        });
+      }
+    }
     const deliveries = Array.isArray(existing.deliveries) ? existing.deliveries : [];
     return jsonResponse({
       request_id: existing.id,
@@ -1441,9 +1635,12 @@ async function handleTrigger(env, db, request) {
   // status update (acknowledged / completed, with notes) may have landed
   // while delivery was in flight, and writing this handler's pre-delivery
   // snapshot back would roll it back to "delivered" and drop the notes.
+  // Ledger-skipped pairs are not merged as new delivery entries — the
+  // drive that actually POSTed merges its own results — but an
+  // already-delivered skip still counts toward the status via anyOk.
   const merged = await db.mergeDelivery(
     "req:" + record.id,
-    results,
+    results.filter((r) => !r.deduplicated),
     results.some((r) => r.ok)
   );
   const final = merged || record;
