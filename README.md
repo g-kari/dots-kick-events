@@ -137,6 +137,8 @@ audience 検証はこの登録 URI との完全一致で行うため、登録が
 ### request_id の重複排除と配送セマンティクス
 
 - `/trigger` に呼び出し側が `request_id` を指定できる（形式: 英数字と `._:-`、最大128文字）。作成は Durable Object 内で原子的な put-if-absent で行うため、再送・同時到着でもレコードは1つしか作られず、二重配送は起きない。重複時は既存レコードの状態を `deduplicated: true` で返す。`request_id` を省略した場合は従来どおりサーバーが採番する。
+- 配送そのものも（依頼 × 購読）の粒度で冪等（1.4.0〜）。各ペアについて、POST の前に Durable Object 内の永続台帳（キー `dlv:<requestId>`、購読ID → 状態のマップ）で claim し、結果を settle（`delivered` / `failed`）する。既に `delivered` のペアと、別の配送が実行中（claim のリース 45 秒以内）のペアは POST せずスキップする。判定は Worker のメモリではなく Durable Object のストレージに置くため、Worker の再起動や呼び出し側の再接続をまたいでも効く。
+- 依頼が `pending` のまま重複 `/trigger` が来た場合（初回の応答が呼び出し側に届かなかった、初回配送が途中で死んだ、全試行が失敗した等）は、台帳で未配送のペアだけを再配送する（再駆動）。台帳が `delivered` なのにレコードへの結果マージだけが失われた場合は、再 POST せずレコードの状態だけを `delivered` に整合させる。claim だけが残ってリース切れになったペア（配送プロセスが settle 前に死んだ痕跡）は、再駆動時に引き継いで再試行する。この場合、初回の POST が受信側に届いていた可能性は排除できないため、最終防衛線は従来どおり決定的な `eventId`（`webhook-id`）による受信側の重複排除になる。
 - Webhook の 2xx は「受信確認」であって「作業完了」ではない。完了は従来どおり `update_request_status` の `completed` で表す。配送リトライでは `eventId`（依頼ID＋購読IDから決定的に生成）を変えないため、受信側でも重複排除できる。各試行では署名タイムスタンプを更新する。受信側は署名検証に加え、タイムスタンプの許容範囲（Standard Webhooks の作法では5分程度）と `eventId` の重複チェックでリプレイに備えること。
 - 依頼レコードへの変更はすべて Durable Object 内で最新レコードへのフィールド単位マージとして直列化して行う（作成は put-if-absent、配送結果は配送履歴の追記＋状態の前進のみ、状態更新は状態の前進＋メモの追記のみ）。Worker 側で読んだ古いスナップショットを丸ごと書き戻す経路はないため、配送と状態更新が並行しても、配送結果・状態・メモのいずれも競合で消えることはない。
 
@@ -163,7 +165,7 @@ audience 検証はこの登録 URI との完全一致で行うため、登録が
 
 ### 検証方法
 
-- 自動テスト（ローカル、合成データのみ、本番に触れない）: `npm install` のあと `npm test`（`test/auth.test.mjs` 21件＋`test/claude-inbox.test.mjs` 13件）。Miniflare 上で実 Worker を起動し、合成 ES256 鍵ペアで署名した 0g0-id 形式 JWT とモック JWKS（outboundService で配信）を使い、メタデータ（`authorization_servers` が 0g0-id を指すこと、内蔵 AS のエンドポイントが 404 であること）、無認証 401、不透明トークンの拒否、有効トークンでの接続→購読→署名付き配送→状態照合→解除の通し、署名不正・ペイロード改ざん・期限切れ・誤 `iss`・誤 `aud` の拒否、スコープ不足 403、別 principal による解除の無効化、未認証発火（IdP トークン流用含む）の拒否、`request_id` 重複の単一配送、payload による状態上書きの不可、鍵ローテーションへの追従、改ざん Webhook の拒否、kick スキーマ互換を確認する。セキュリティレビュー対応として、**所有者以外の正規トークン（全スコープ）での購読・照合・更新・解除の拒否と配送の所有者限定、`OWNER_SUB` 未設定時の fail closed、IPv6 プライベートリテラル（loopback／ULA／link-local／IPv4-mapped）の拒否、配送中に届いた状態更新が配送後の保存で巻き戻らないこと、配送と状態・メモ更新を並行に走らせても両方向の競合で配送結果・状態・メモが消えないこと**の回帰テストも含む。GitHub Actions（`.github/workflows/ci.yml`）でも push / pull_request のたびに同じテストスイートを実行する。
+- 自動テスト（ローカル、合成データのみ、本番に触れない）: `npm install` のあと `npm test`（`test/auth.test.mjs` 21件＋`test/claude-inbox.test.mjs` 13件＋`test/delivery-dedup.test.mjs` 6件）。Miniflare 上で実 Worker を起動し、合成 ES256 鍵ペアで署名した 0g0-id 形式 JWT とモック JWKS（outboundService で配信）を使い、メタデータ（`authorization_servers` が 0g0-id を指すこと、内蔵 AS のエンドポイントが 404 であること）、無認証 401、不透明トークンの拒否、有効トークンでの接続→購読→署名付き配送→状態照合→解除の通し、署名不正・ペイロード改ざん・期限切れ・誤 `iss`・誤 `aud` の拒否、スコープ不足 403、別 principal による解除の無効化、未認証発火（IdP トークン流用含む）の拒否、`request_id` 重複の単一配送、payload による状態上書きの不可、鍵ローテーションへの追従、改ざん Webhook の拒否、kick スキーマ互換を確認する。セキュリティレビュー対応として、**所有者以外の正規トークン（全スコープ）での購読・照合・更新・解除の拒否と配送の所有者限定、`OWNER_SUB` 未設定時の fail closed、IPv6 プライベートリテラル（loopback／ULA／link-local／IPv4-mapped）の拒否、配送中に届いた状態更新が配送後の保存で巻き戻らないこと、配送と状態・メモ更新を並行に走らせても両方向の競合で配送結果・状態・メモが消えないこと、配送台帳による二重 POST の抑止（失敗した配送の再送が一度だけ再駆動されること、配送中の重複発火でも1回しか届かないこと、結果マージが失われても再 POST せず状態だけが整合すること、死んだ配送の claim 残りを引き継げること、重複排除の状態が Worker 再起動をまたいで保持されること）**の回帰テストも含む。GitHub Actions（`.github/workflows/ci.yml`）でも push / pull_request のたびに同じテストスイートを実行する。
 - デプロイ後の実機確認: 保護リソースメタデータが 200 で `authorization_servers` に 0g0-id が入ること、無認証の `initialize` が 401 + `WWW-Authenticate` になること、ChatGPT の接続で 0g0-id のログイン画面に遷移し、認可後に `kick` の購読が作れること。
 
 ## 発火方法（管理用）
