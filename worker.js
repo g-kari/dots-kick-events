@@ -1859,13 +1859,15 @@ async function handleTestEcho(env, db, request) {
 
 // ---------- isolated, opt-in verified Croissand reply queue ----------
 //
-// No polling, outbound send, or production ACK route consumes this queue.
+// The dedicated recipient may pull and ACK; there is no outbound send.
 // Existing Muse inbox consumers and the admin status API only use "creq:".
 const CROISSAND_REQUEST_PREFIX = "req_croissand_";
 const CROISSAND_REQUEST_ID = /^req_croissand_[0-9a-f]{64}$/;
 const CROISSAND_SOURCE = "croissand";
 const CROISSAND_TOPIC = "croissand:progress";
+const CROISSAND_CONSUMER_PATH = "/croissand-reply";
 const CROISSAND_REPLY_MAX_AGE_MS = 15 * 60 * 1000;
+const CROISSAND_CONSUME_MAX_AGE_MS = 15 * 60 * 1000;
 const CROISSAND_TOOLS = [
   {
     name: "queue_croissand_reply",
@@ -1968,7 +1970,10 @@ async function croissandReply(db, env, args, enqueue) {
     const text = args?.text;
     if (typeof text !== "string" || !text.trim() || text.length > 2000 ||
         Object.keys(args).some((k) => k !== "request_id" && k !== "text")) return { error: "invalid_reply" };
-    const candidate = { id, requestId, recipient: CROISSAND_SOURCE, text, acceptedAt: new Date().toISOString() };
+    const candidate = {
+      id, requestId, recipient: CROISSAND_SOURCE, text,
+      acceptedAt: new Date().toISOString(), ackToken: crypto.randomUUID(),
+    };
     const { value } = await db.create(key, JSON.stringify(candidate));
     stored = JSON.parse(value);
     if (stored.id !== id || stored.requestId !== requestId ||
@@ -1978,11 +1983,93 @@ async function croissandReply(db, env, args, enqueue) {
     if (existing == null) return { error: "reply_not_found" };
     stored = JSON.parse(existing);
   }
+  return croissandReceipt(db, stored);
+}
+
+async function croissandReceipt(db, stored) {
+  const ack = await db.get("verified-reply-ack:" + stored.id);
   return {
     request_id: stored.requestId, reply_id: stored.id,
-    status: "accepted", accepted_at: stored.acceptedAt,
-    delivered: false, recipient_acknowledged: false,
+    status: ack === null ? "accepted" : "recipient_acknowledged",
+    accepted_at: stored.acceptedAt,
+    delivered: ack !== null, recipient_acknowledged: ack !== null,
+    ...(ack === null ? {} : { acknowledged_at: ack }),
   };
+}
+
+function croissandConsumerSecret(env, config) {
+  if (!config || env.CROISSAND_CONSUMER_ENABLED !== "1") return null;
+  const secret = env.CROISSAND_CONSUMER_SECRET;
+  if (typeof secret !== "string") return null;
+  try {
+    const decode = (s) => b64decode(s.replace(/^whsec_/, ""));
+    const bytes = decode(secret);
+    if (bytes.length < 32) return null;
+    for (const other of [config.secret, env.CLAUDE_HOOK_SECRET, env.TRIGGER_KEY]) {
+      if (!other) continue;
+      if (timingSafeEqualStr(secret, other)) return null;
+      try {
+        if (timingSafeEqualStr(b64encode(bytes), b64encode(decode(other)))) return null;
+      } catch (_) { /* Legacy keys may not be base64. */ }
+    }
+    return secret;
+  } catch (_) { return null; }
+}
+
+async function handleCroissandConsumer(env, db, request) {
+  const respond = (data, status = 200) => jsonResponse(data, status, { "Cache-Control": "no-store" });
+  const config = croissandConfig(env);
+  const secret = croissandConsumerSecret(env, config);
+  if (!secret) return respond({ error: "not found" }, 404);
+  const timestamp = request.headers.get("webhook-timestamp") || "";
+  const messageId = request.headers.get("webhook-id") || "";
+  const timestampMs = Number(timestamp) * 1000;
+  if (!/^\d{10}$/.test(timestamp) || timestampMs < config.notBefore ||
+      Math.abs(Date.now() - timestampMs) > 300_000 || !REQUEST_ID_PATTERN.test(messageId)) {
+    return respond({ error: "unverified recipient" }, 401);
+  }
+  const bytes = await request.arrayBuffer();
+  if (bytes.byteLength > 4096) return respond({ error: "body too large" }, 413);
+  let body;
+  try { body = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); }
+  catch (_) { return respond({ error: "invalid UTF-8" }, 400); }
+  if (!(await verifyBody(secret, messageId, timestamp, CROISSAND_CONSUMER_PATH + "\n" + body,
+      request.headers.get("webhook-signature")))) return respond({ error: "unverified recipient" }, 401);
+  let data;
+  try { data = JSON.parse(body); } catch (_) { return respond({ error: "invalid JSON body" }, 400); }
+  const sourceId = data?.source_request_id;
+  const ack = data?.operation === "ack";
+  const allowed = ack ? ["operation", "source_request_id", "reply_id", "ack_token"] : ["operation", "source_request_id"];
+  if ((!ack && data?.operation !== "fetch") || typeof sourceId !== "string" || !REQUEST_ID_PATTERN.test(sourceId) ||
+      Object.keys(data).some((key) => !allowed.includes(key))) return respond({ error: "invalid request" }, 400);
+  const requestId = CROISSAND_REQUEST_PREFIX + await sha256Hex(JSON.stringify([CROISSAND_SOURCE, sourceId]));
+  const id = "croissand_reply_" + await sha256Hex(requestId);
+  const raw = await db.get("verified-reply:" + id);
+  const row = raw == null ? null : JSON.parse(raw);
+  const originRaw = await db.get("req:" + requestId);
+  const origin = originRaw == null ? null : JSON.parse(originRaw);
+  if (row?.id !== id || row?.requestId !== requestId || row?.recipient !== CROISSAND_SOURCE ||
+      origin?.sourceRequestId !== sourceId || origin?.verifiedSource !== CROISSAND_SOURCE ||
+      origin?.origin !== "verified_croissand" || origin?.topic !== CROISSAND_TOPIC ||
+      !(Date.parse(origin?.sourceCreatedAt) >= config.notBefore)) {
+    return respond({ error: "reply not found" }, 404);
+  }
+  // Existing acceptance records predating the consumer have no ACK token.
+  if (typeof row.ackToken !== "string") return respond({ error: "reply unavailable" }, 409);
+  const receipt = await croissandReceipt(db, row);
+  const acceptedAt = Date.parse(row.acceptedAt);
+  if (!receipt.recipient_acknowledged && (!Number.isFinite(acceptedAt) || acceptedAt < config.notBefore ||
+      acceptedAt > Date.now() || Date.now() - acceptedAt > CROISSAND_CONSUME_MAX_AGE_MS)) {
+    return respond({ error: "reply expired" }, 410);
+  }
+  if (ack) {
+    if (data.reply_id !== id || typeof data.ack_token !== "string" ||
+        !timingSafeEqualStr(row.ackToken, data.ack_token)) return respond({ error: "reply mismatch" }, 409);
+    if (receipt.recipient_acknowledged) return respond(receipt);
+    await db.create("verified-reply-ack:" + id, new Date().toISOString());
+    return respond(await croissandReceipt(db, row));
+  }
+  return respond(receipt.recipient_acknowledged ? receipt : { ...receipt, text: row.text, ack_token: row.ackToken });
 }
 
 // ---------- router ----------
@@ -2007,6 +2094,9 @@ export default {
       if (url.pathname === "/mcp") {
         if (request.method === "POST") return handleMcp(db, request, env);
         return jsonResponse(rpcError(null, -32600, "Method not allowed"), 405);
+      }
+      if (url.pathname === CROISSAND_CONSUMER_PATH && request.method === "POST") {
+        return handleCroissandConsumer(env, db, request);
       }
       if (url.pathname === "/croissand-kick" && request.method === "POST") {
         return handleCroissandKick(env, db, request);

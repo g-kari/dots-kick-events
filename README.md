@@ -222,10 +222,10 @@ curl -X POST https://dots-events.0g0.xyz/trigger \
 
 ## Verified Croissand reply pilot (disabled by default)
 
-This is an isolated queue, not a reply sender. Nothing reads or sends queued
-replies on behalf of Croissand, even when the pilot is enabled. Do not enable
-the pilot or configure production bindings until the sender and consumed route
-have been independently identified and approved.
+This is an isolated pull-and-ack queue, not an outbound reply sender. Both
+gates are off by default. Do not enable the pilot or configure production
+bindings until the counterpart and its consumer have been independently verified
+and approved.
 
 - Only a locally configured pilot (`CROISSAND_REPLY_ENABLED=1`, a dedicated
   `CROISSAND_HOOK_SECRET` with at least 32 bytes of decoded key material, and a
@@ -250,3 +250,24 @@ have been independently identified and approved.
   A queue acceptance is not delivery, and the
   legacy shared-admin inbox status is not recipient proof. Pilot records are
   invisible to existing Muse pollers. Discord is unchanged.
+
+
+- For local integration, opt in separately with `CROISSAND_CONSUMER_ENABLED=1`
+  and a distinct `CROISSAND_CONSUMER_SECRET` (at least 32 decoded bytes; never
+  reuse the ingress or legacy secrets). Both consumer operations use
+  `POST /croissand-reply` and the usual webhook headers. Sign
+  `webhook-id.webhook-timestamp./croissand-reply\n<exact UTF-8 body>`;
+  the newline is literal. The signature is accepted for five minutes.
+- Send `{"operation":"fetch","source_request_id":"<original-id>"}` to get
+  the immutable reply and its ACK token. Fetching does **not** mark delivery.
+  The consumer must persist/process the reply idempotently by `reply_id`
+  before sending `ack` with the same source ID, reply ID and ACK token.
+  Concurrent fetches may return the same reply. A matching ACK is idempotent;
+  only the first stores an acknowledgement timestamp. Subsequent fetches
+  return the receipt without the reply body or ACK token. Unacknowledged
+  replies expire 15 minutes after queue acceptance; expired rows are not
+  delivered. An existing ACK receipt remains readable.
+- An authenticated ACK attests receipt by the configured consumer, not human
+  readership. Previous pilot rows without a token remain acceptance-only.
+  No production consumer, credentials, deployment or live sending is
+  configured by this code.

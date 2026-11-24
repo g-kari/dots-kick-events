@@ -299,6 +299,7 @@ test("tools/list includes kick_claude", async () => {
 
 test("Croissand reply is owner-scoped, immutable, default-off, and absent from Muse inbox", async (t) => {
   const CROISSAND_KEY = "whsec_" + randomBytes(32).toString("base64");
+  const CONSUMER_KEY = "whsec_" + randomBytes(32).toString("base64");
   const activation = new Date(Date.now() - 20 * 60_000).toISOString();
   const local = new Miniflare({
     modules: true,
@@ -309,7 +310,8 @@ test("Croissand reply is owner-scoped, immutable, default-off, and absent from M
       TRIGGER_KEY, CLAUDE_HOOK_SECRET: HOOK_SECRET, IDP_ISSUER: ISSUER,
       RESOURCE_URI: RESOURCE, OWNER_SUB: "user-1",
       CROISSAND_REPLY_ENABLED: "1", CROISSAND_REPLY_NOT_BEFORE: activation,
-      CROISSAND_HOOK_SECRET: CROISSAND_KEY,
+      CROISSAND_HOOK_SECRET: CROISSAND_KEY, CROISSAND_CONSUMER_ENABLED: "1",
+      CROISSAND_CONSUMER_SECRET: CONSUMER_KEY,
     },
     outboundService,
   });
@@ -327,7 +329,7 @@ test("Croissand reply is owner-scoped, immutable, default-off, and absent from M
       method: "POST",
       headers: {
         "Content-Type": "application/json", "webhook-id": msgId,
-        "webhook-timestamp": ts, "webhook-signature": signHook(secret, msgId, ts, body),
+        "webhook-timestamp": ts, "webhook-signature": signHook(secret, msgId, ts, endpoint === "/croissand-reply" ? endpoint + "\n" + body : body),
       },
       body,
     });
@@ -387,6 +389,38 @@ test("Croissand reply is owner-scoped, immutable, default-off, and absent from M
   assert.equal(next.status, "accepted");
   assert.notEqual(next.reply_id, replies[0].reply_id);
 
+  const recipient = (data, key = CONSUMER_KEY, worker = local) =>
+    signed(data, worker, key, "/croissand-reply");
+  const fetchReply = { operation: "fetch", source_request_id: original.request_id };
+  assert.equal((await recipient(fetchReply, CONSUMER_KEY, mf))[0], 404);
+  for (const key of [CROISSAND_KEY, HOOK_SECRET]) assert.equal((await recipient(fetchReply, key))[0], 401);
+  assert.equal((await recipient({ ...fetchReply, source_request_id: request_id }))[0], 404);
+  const [fetchedStatus, fetched] = await recipient(fetchReply);
+  assert.equal(fetchedStatus, 200);
+  assert.equal(fetched.text, text);
+  assert.equal(fetched.reply_id, replies[0].reply_id);
+  assert.equal(fetched.delivered, false);
+  assert.deepEqual(await lookup(), replies[0]);
+  const ack = {
+    operation: "ack", source_request_id: original.request_id, reply_id: fetched.reply_id, ack_token: fetched.ack_token,
+  };
+  assert.equal((await recipient(ack, CROISSAND_KEY))[0], 401);
+  assert.equal((await recipient({ ...ack, ack_token: "wrong" }))[0], 409);
+  assert.equal((await recipient({ ...ack, source_request_id: "source-record-2", reply_id: next.reply_id }))[0], 409);
+  const acks = await Promise.all(Array.from({ length: 5 }, () => recipient(ack)));
+  for (const [ackStatus, receipt] of acks) {
+    assert.equal(ackStatus, 200);
+    assert.deepEqual(receipt, acks[0][1]);
+  }
+  const receipt = await lookup();
+  assert.deepEqual(receipt, acks[0][1]);
+  assert.equal(receipt.status, "recipient_acknowledged");
+  assert.equal(receipt.delivered, true);
+  assert.equal(receipt.recipient_acknowledged, true);
+  assert.deepEqual((await recipient(fetchReply))[1], receipt);
+  assert(!Object.hasOwn(receipt, "ack_token"));
+  assert(!Object.hasOwn(receipt, "text"));
+
   // Advance the effective age of fixture rows without waiting 15 minutes.
   // Only the test has access to the private Durable Object storage routes.
   const namespace = await local.getDurableObjectNamespace("STORE");
@@ -404,9 +438,32 @@ test("Croissand reply is owner-scoped, immutable, default-off, and absent from M
     });
     assert.equal(put.ok, true);
   };
+  const ageReply = async (replyId) => {
+    const key = "verified-reply:" + replyId;
+    const get = await stub.fetch("https://store/get?key=" + encodeURIComponent(key));
+    const row = JSON.parse(await get.text());
+    const put = await stub.fetch("https://store/put", {
+      method: "POST",
+      body: JSON.stringify({ key, value: JSON.stringify({ ...row, acceptedAt: fixtureTime }) }),
+    });
+    assert.equal(put.ok, true);
+  };
+  const fetchSecond = { operation: "fetch", source_request_id: "source-record-2" };
+  const unacked = (await recipient(fetchSecond))[1];
+  assert.equal(unacked.reply_id, next.reply_id);
+  await ageReply(next.reply_id);
+  assert.equal((await recipient(fetchSecond))[0], 410);
+  assert.equal((await recipient({
+    ...fetchSecond, operation: "ack", reply_id: next.reply_id, ack_token: unacked.ack_token,
+  }))[0], 410);
+  assert.equal(toolJson(await call("read_croissand_reply_receipt", {
+    request_id: another.request_id,
+  })).recipient_acknowledged, false);
+  await ageReply(fetched.reply_id);
+  assert.equal((await recipient(ack))[1].acknowledged_at, receipt.acknowledged_at);
   await ageFixture(request_id);
   assert.equal((await write()).error, "expired_request");
-  assert.deepEqual(await lookup(), replies[0]);
+  assert.equal((await lookup()).acknowledged_at, receipt.acknowledged_at);
   const [, stale] = await signed({ ...original, request_id: "source-record-3" });
   await ageFixture(stale.request_id);
   assert.equal(toolJson(await call("queue_croissand_reply", { request_id: stale.request_id, text })).error, "expired_request");
