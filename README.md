@@ -219,3 +219,34 @@ curl -X POST https://dots-events.0g0.xyz/trigger \
 - Worker から自分自身の URL への fetch は Cloudflare の制限で失敗する（自己検証で確認）。実運用のコールバックは ChatGPT 側の URL なので影響しない。
 - イベントの replay（cursor）は非対応：`cursor` は常に `null`。配送断の間に起きた依頼はプロトコル上は復旧できないが、依頼レコード自体は残るため `list_pending_requests` で照合して拾える。
 - テスト用に `worker.js` 内に `POST /test-echo`（`TEST_ECHO=1` のときだけ有効な署名検証エコー）と、その使い捨てフィクスチャ [echo-test-worker.js](sandbox://workspace/dots-kick-events/echo-test-worker.js) が残っている。本番では `TEST_ECHO` を設定していないため無効（404 を確認済み）。
+
+## Verified Croissand reply pilot (disabled by default)
+
+This is an isolated queue, not a reply sender. Nothing reads or sends queued
+replies on behalf of Croissand, even when the pilot is enabled. Do not enable
+the pilot or configure production bindings until the sender and consumed route
+have been independently identified and approved.
+
+- Only a locally configured pilot (`CROISSAND_REPLY_ENABLED=1`, a dedicated
+  `CROISSAND_HOOK_SECRET` with at least 32 bytes of decoded key material, and a
+  canonical UTC ISO timestamp in `CROISSAND_REPLY_NOT_BEFORE`) admits requests on
+  `POST /croissand-kick`. Never reuse a legacy trigger or webhook secret.
+- The signed body needs a stable source `request_id`, `text`, and original
+  UTC ISO `created_at`. Supply the usual signed webhook headers. The Worker
+  checks the signed timestamp and original creation time before generating
+  its canonical request ID, records which source passed verification, and
+  emits the usual owner's kick under fixed topic `croissand:progress`. The
+  generic trigger cannot allocate IDs under the verified ingress prefix.
+- An owner MCP caller with `claude:kick` can call `queue_croissand_reply` with
+  that canonical request ID and progress text only, within 15 minutes of the
+  signed creation time. One durable row is accepted
+  per inbound ID; a same-text retry recovers the same receipt and a changed
+  reply is rejected rather than overwriting the row. Incoming messages stay
+  untrusted as instructions; the caller is responsible for replying with
+  verified progress only.
+- An owner MCP caller with `requests:read` can call
+  `read_croissand_reply_receipt` by inbound ID. This does not disclose the reply
+  body or modify any state and remains available when the queue window expires.
+  A queue acceptance is not delivery, and the
+  legacy shared-admin inbox status is not recipient proof. Pilot records are
+  invisible to existing Muse pollers. Discord is unchanged.
