@@ -1289,7 +1289,7 @@ function toolText(obj, isError = false) {
   return result;
 }
 
-async function handleToolsCall(db, id, params) {
+async function handleToolsCall(db, id, params, env) {
   const name = params?.name;
   const args = params?.arguments ?? {};
   if (name === "list_pending_requests") {
@@ -1324,6 +1324,11 @@ async function handleToolsCall(db, id, params) {
       return rpcResult(id, toolText({ error: "request not found" }, true));
     }
     return rpcResult(id, toolText(record));
+  }
+  if (name === "queue_croissand_reply" || name === "read_croissand_reply_receipt") {
+    if (!croissandConfig(env)) return rpcError(id, -32602, "Tool unavailable");
+    const result = await croissandReply(db, env, args, name === "queue_croissand_reply");
+    return rpcResult(id, toolText(result, !!result.error));
   }
   if (name === "kick_claude") {
     const text = typeof args.text === "string" ? args.text.trim() : "";
@@ -1402,14 +1407,14 @@ function requiredScope(msg) {
     case "tools/call":
       if (params?.name === "list_pending_requests") return "requests:read";
       if (params?.name === "update_request_status") return "requests:update";
-      if (params?.name === "kick_claude") return "claude:kick";
+      if (params?.name === "kick_claude" || params?.name === "queue_croissand_reply") return "claude:kick";
       return "requests:read";
     default:
       return null;
   }
 }
 
-async function handleRpc(db, msg, auth) {
+async function handleRpc(db, msg, auth, env) {
   const { id, method, params } = msg || {};
   const isNotification = id === undefined || id === null;
 
@@ -1432,9 +1437,9 @@ async function handleRpc(db, msg, auth) {
     case "ping":
       return rpcResult(id, {});
     case "tools/list":
-      return rpcResult(id, { tools: TOOLS });
+      return rpcResult(id, { tools: croissandConfig(env) && isOwner(env, auth) ? [...TOOLS, ...CROISSAND_TOOLS.filter((tool) => auth.scope.has(tool.scope)).map(({scope, ...tool}) => tool)] : TOOLS });
     case "tools/call":
-      return handleToolsCall(db, id, params || {});
+      return handleToolsCall(db, id, params || {}, env);
     case "events/list":
       return rpcResult(id, { events: [KICK_EVENT] });
     case "events/subscribe":
@@ -1498,7 +1503,7 @@ async function handleMcp(db, request, env) {
       responses.push(errBody);
       continue;
     }
-    const res = await handleRpc(db, msg, auth);
+    const res = await handleRpc(db, msg, auth, env);
     if (res) responses.push(res);
   }
   if (!Array.isArray(parsed)) {
@@ -1568,6 +1573,9 @@ async function handleTrigger(env, db, request) {
     return jsonResponse({ error: "request_id format is invalid" }, 400);
   }
 
+  if (suppliedId?.startsWith(CROISSAND_REQUEST_PREFIX)) {
+    return jsonResponse({ error: "request_id uses reserved prefix" }, 400);
+  }
   const nowIso = new Date().toISOString();
   const record = {
     id: suppliedId || "req_" + randomHex(16),
@@ -1580,6 +1588,10 @@ async function handleTrigger(env, db, request) {
   };
   if (topic) record.topic = topic;
 
+  return fileKickRequest(env, db, record);
+}
+
+async function fileKickRequest(env, db, record) {
   // Creation always goes through the atomic put-if-absent, for
   // server-generated IDs too: every write to a request record is then
   // one of the Durable Object's serialized operations (create,
@@ -1591,6 +1603,12 @@ async function handleTrigger(env, db, request) {
   );
   if (!created) {
     const existing = JSON.parse(value);
+    if (record.verifiedSource && (existing.verifiedSource !== record.verifiedSource ||
+        existing.sourceRequestId !== record.sourceRequestId || existing.sourceCreatedAt !== record.sourceCreatedAt ||
+        existing.text !== record.text ||
+        existing.topic !== record.topic)) {
+      return jsonResponse({ error: "conflicting verified request" }, 409);
+    }
     // Re-drive: a duplicate /trigger for a request that is still
     // "pending" means no successful delivery outcome was ever merged
     // for it — the first caller's connection was cut, this endpoint's
@@ -1839,6 +1857,221 @@ async function handleTestEcho(env, db, request) {
   return jsonResponse({ ok: true });
 }
 
+// ---------- isolated, opt-in verified Croissand reply queue ----------
+//
+// The dedicated recipient may pull and ACK; there is no outbound send.
+// Existing Muse inbox consumers and the admin status API only use "creq:".
+const CROISSAND_REQUEST_PREFIX = "req_croissand_";
+const CROISSAND_REQUEST_ID = /^req_croissand_[0-9a-f]{64}$/;
+const CROISSAND_SOURCE = "croissand";
+const CROISSAND_TOPIC = "croissand:progress";
+const CROISSAND_CONSUMER_PATH = "/croissand-reply";
+const CROISSAND_REPLY_MAX_AGE_MS = 15 * 60 * 1000;
+const CROISSAND_CONSUME_MAX_AGE_MS = 15 * 60 * 1000;
+const CROISSAND_TOOLS = [
+  {
+    name: "queue_croissand_reply",
+    scope: "claude:kick",
+    description: "Accept one progress reply for an authenticated, fresh Croissand request. Does not deliver a message.",
+    inputSchema: {
+      type: "object",
+      properties: { request_id: { type: "string" }, text: { type: "string", maxLength: 2000 } },
+      required: ["request_id", "text"], additionalProperties: false,
+    },
+  },
+  {
+    name: "read_croissand_reply_receipt",
+    scope: "requests:read",
+    description: "Read the queue acceptance receipt for a Croissand request, without sending or mutating anything.",
+    inputSchema: {
+      type: "object",
+      properties: { request_id: { type: "string" } },
+      required: ["request_id"], additionalProperties: false,
+    },
+  },
+];
+
+function croissandConfig(env) {
+  if (env?.CROISSAND_REPLY_ENABLED !== "1" || !configuredOwnerSub(env)) return null;
+  const secret = env.CROISSAND_HOOK_SECRET;
+  const at = env.CROISSAND_REPLY_NOT_BEFORE;
+  const notBefore = typeof at === "string" ? Date.parse(at) : NaN;
+  if (!Number.isFinite(notBefore) || new Date(notBefore).toISOString() !== at) return null;
+  try {
+    const decoded = b64decode(String(secret).replace(/^whsec_/, ""));
+    if (decoded.length < 32) return null;
+    // Never promote either of the legacy shared credentials to sender identity.
+    for (const other of [env.CLAUDE_HOOK_SECRET, env.TRIGGER_KEY]) {
+      if (!other) continue;
+      if (timingSafeEqualStr(secret, other)) return null;
+      try {
+        if (timingSafeEqualStr(b64encode(decoded), b64encode(b64decode(other.replace(/^whsec_/, ""))))) return null;
+      } catch (_) { /* Legacy trigger keys need not be base64. */ }
+    }
+  } catch (_) { return null; }
+  return { secret, notBefore };
+}
+
+async function handleCroissandKick(env, db, request) {
+  const config = croissandConfig(env);
+  if (!config) return jsonResponse({ error: "not found" }, 404);
+  const now = Date.now();
+  const timestamp = request.headers.get("webhook-timestamp") || "";
+  const messageId = request.headers.get("webhook-id") || "";
+  const timestampMs = Number(timestamp) * 1000;
+  const body = await request.text();
+  if (new TextEncoder().encode(body).length > MAX_BODY_BYTES) return jsonResponse({ error: "body too large" }, 413);
+  if (!/^\d{10}$/.test(timestamp) || timestampMs < config.notBefore ||
+      Math.abs(now - timestampMs) > 300_000 || !REQUEST_ID_PATTERN.test(messageId) ||
+      !(await verifyBody(config.secret, messageId, timestamp, body, request.headers.get("webhook-signature")))) {
+    return jsonResponse({ error: "unverified sender or stale event" }, 401);
+  }
+  let data;
+  try { data = JSON.parse(body); } catch (_) {
+    return jsonResponse({ error: "invalid JSON body" }, 400);
+  }
+  if (typeof data?.request_id !== "string" || !REQUEST_ID_PATTERN.test(data.request_id) ||
+      typeof data?.text !== "string" || !data.text.trim() || data.text.length > 8000) {
+    return jsonResponse({ error: "a stable request_id and text are required" }, 400);
+  }
+  const sourceCreatedAt = typeof data.created_at === "string" ? Date.parse(data.created_at) : NaN;
+  if (!Number.isFinite(sourceCreatedAt) || new Date(sourceCreatedAt).toISOString() !== data.created_at ||
+      sourceCreatedAt < config.notBefore || sourceCreatedAt > now || now - sourceCreatedAt > 300_000) {
+    return jsonResponse({ error: "ineligible event creation time" }, 400);
+  }
+  const id = CROISSAND_REQUEST_PREFIX + await sha256Hex(JSON.stringify([CROISSAND_SOURCE, data.request_id]));
+  const createdAt = new Date(now).toISOString();
+  return fileKickRequest(env, db, {
+    id, text: data.text, topic: CROISSAND_TOPIC, status: "pending",
+    createdAt, updatedAt: createdAt, deliveries: [], origin: "verified_croissand",
+    verifiedSource: CROISSAND_SOURCE, sourceRequestId: data.request_id, sourceCreatedAt: data.created_at,
+  });
+}
+
+async function croissandReply(db, env, args, enqueue) {
+  const requestId = args?.request_id;
+  if (typeof requestId !== "string" || !CROISSAND_REQUEST_ID.test(requestId)) return { error: "ineligible_request" };
+  const raw = await db.get("req:" + requestId);
+  const incoming = raw == null ? null : JSON.parse(raw);
+  const { notBefore } = croissandConfig(env);
+  const acceptedAt = Date.parse(incoming?.createdAt);
+  const sourceCreatedAt = Date.parse(incoming?.sourceCreatedAt);
+  if (incoming?.id !== requestId || incoming?.verifiedSource !== CROISSAND_SOURCE ||
+      incoming?.origin !== "verified_croissand" || incoming?.topic !== CROISSAND_TOPIC ||
+      !Number.isFinite(acceptedAt) || acceptedAt < notBefore || acceptedAt > Date.now() ||
+      !Number.isFinite(sourceCreatedAt) || sourceCreatedAt < notBefore || sourceCreatedAt > acceptedAt) {
+    return { error: "ineligible_request" };
+  }
+  const id = "croissand_reply_" + await sha256Hex(requestId);
+  const key = "verified-reply:" + id;
+  let stored;
+  if (enqueue) {
+    if (Date.now() - sourceCreatedAt > CROISSAND_REPLY_MAX_AGE_MS) return { error: "expired_request" };
+    const text = args?.text;
+    if (typeof text !== "string" || !text.trim() || text.length > 2000 ||
+        Object.keys(args).some((k) => k !== "request_id" && k !== "text")) return { error: "invalid_reply" };
+    const candidate = {
+      id, requestId, recipient: CROISSAND_SOURCE, text,
+      acceptedAt: new Date().toISOString(), ackToken: crypto.randomUUID(),
+    };
+    const { value } = await db.create(key, JSON.stringify(candidate));
+    stored = JSON.parse(value);
+    if (stored.id !== id || stored.requestId !== requestId ||
+        stored.recipient !== CROISSAND_SOURCE || stored.text !== text) return { error: "conflicting_reply" };
+  } else {
+    const existing = await db.get(key);
+    if (existing == null) return { error: "reply_not_found" };
+    stored = JSON.parse(existing);
+  }
+  return croissandReceipt(db, stored);
+}
+
+async function croissandReceipt(db, stored) {
+  const ack = await db.get("verified-reply-ack:" + stored.id);
+  return {
+    request_id: stored.requestId, reply_id: stored.id,
+    status: ack === null ? "accepted" : "recipient_acknowledged",
+    accepted_at: stored.acceptedAt,
+    delivered: ack !== null, recipient_acknowledged: ack !== null,
+    ...(ack === null ? {} : { acknowledged_at: ack }),
+  };
+}
+
+function croissandConsumerSecret(env, config) {
+  if (!config || env.CROISSAND_CONSUMER_ENABLED !== "1") return null;
+  const secret = env.CROISSAND_CONSUMER_SECRET;
+  if (typeof secret !== "string") return null;
+  try {
+    const decode = (s) => b64decode(s.replace(/^whsec_/, ""));
+    const bytes = decode(secret);
+    if (bytes.length < 32) return null;
+    for (const other of [config.secret, env.CLAUDE_HOOK_SECRET, env.TRIGGER_KEY]) {
+      if (!other) continue;
+      if (timingSafeEqualStr(secret, other)) return null;
+      try {
+        if (timingSafeEqualStr(b64encode(bytes), b64encode(decode(other)))) return null;
+      } catch (_) { /* Legacy keys may not be base64. */ }
+    }
+    return secret;
+  } catch (_) { return null; }
+}
+
+async function handleCroissandConsumer(env, db, request) {
+  const respond = (data, status = 200) => jsonResponse(data, status, { "Cache-Control": "no-store" });
+  const config = croissandConfig(env);
+  const secret = croissandConsumerSecret(env, config);
+  if (!secret) return respond({ error: "not found" }, 404);
+  const timestamp = request.headers.get("webhook-timestamp") || "";
+  const messageId = request.headers.get("webhook-id") || "";
+  const timestampMs = Number(timestamp) * 1000;
+  if (!/^\d{10}$/.test(timestamp) || timestampMs < config.notBefore ||
+      Math.abs(Date.now() - timestampMs) > 300_000 || !REQUEST_ID_PATTERN.test(messageId)) {
+    return respond({ error: "unverified recipient" }, 401);
+  }
+  const bytes = await request.arrayBuffer();
+  if (bytes.byteLength > 4096) return respond({ error: "body too large" }, 413);
+  let body;
+  try { body = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); }
+  catch (_) { return respond({ error: "invalid UTF-8" }, 400); }
+  if (!(await verifyBody(secret, messageId, timestamp, CROISSAND_CONSUMER_PATH + "\n" + body,
+      request.headers.get("webhook-signature")))) return respond({ error: "unverified recipient" }, 401);
+  let data;
+  try { data = JSON.parse(body); } catch (_) { return respond({ error: "invalid JSON body" }, 400); }
+  const sourceId = data?.source_request_id;
+  const ack = data?.operation === "ack";
+  const allowed = ack ? ["operation", "source_request_id", "reply_id", "ack_token"] : ["operation", "source_request_id"];
+  if ((!ack && data?.operation !== "fetch") || typeof sourceId !== "string" || !REQUEST_ID_PATTERN.test(sourceId) ||
+      Object.keys(data).some((key) => !allowed.includes(key))) return respond({ error: "invalid request" }, 400);
+  const requestId = CROISSAND_REQUEST_PREFIX + await sha256Hex(JSON.stringify([CROISSAND_SOURCE, sourceId]));
+  const id = "croissand_reply_" + await sha256Hex(requestId);
+  const raw = await db.get("verified-reply:" + id);
+  const row = raw == null ? null : JSON.parse(raw);
+  const originRaw = await db.get("req:" + requestId);
+  const origin = originRaw == null ? null : JSON.parse(originRaw);
+  if (row?.id !== id || row?.requestId !== requestId || row?.recipient !== CROISSAND_SOURCE ||
+      origin?.sourceRequestId !== sourceId || origin?.verifiedSource !== CROISSAND_SOURCE ||
+      origin?.origin !== "verified_croissand" || origin?.topic !== CROISSAND_TOPIC ||
+      !(Date.parse(origin?.sourceCreatedAt) >= config.notBefore)) {
+    return respond({ error: "reply not found" }, 404);
+  }
+  // Existing acceptance records predating the consumer have no ACK token.
+  if (typeof row.ackToken !== "string") return respond({ error: "reply unavailable" }, 409);
+  const receipt = await croissandReceipt(db, row);
+  const acceptedAt = Date.parse(row.acceptedAt);
+  if (!receipt.recipient_acknowledged && (!Number.isFinite(acceptedAt) || acceptedAt < config.notBefore ||
+      acceptedAt > Date.now() || Date.now() - acceptedAt > CROISSAND_CONSUME_MAX_AGE_MS)) {
+    return respond({ error: "reply expired" }, 410);
+  }
+  if (ack) {
+    if (data.reply_id !== id || typeof data.ack_token !== "string" ||
+        !timingSafeEqualStr(row.ackToken, data.ack_token)) return respond({ error: "reply mismatch" }, 409);
+    if (receipt.recipient_acknowledged) return respond(receipt);
+    await db.create("verified-reply-ack:" + id, new Date().toISOString());
+    return respond(await croissandReceipt(db, row));
+  }
+  return respond(receipt.recipient_acknowledged ? receipt : { ...receipt, text: row.text, ack_token: row.ackToken });
+}
+
 // ---------- router ----------
 
 export default {
@@ -1861,6 +2094,12 @@ export default {
       if (url.pathname === "/mcp") {
         if (request.method === "POST") return handleMcp(db, request, env);
         return jsonResponse(rpcError(null, -32600, "Method not allowed"), 405);
+      }
+      if (url.pathname === CROISSAND_CONSUMER_PATH && request.method === "POST") {
+        return handleCroissandConsumer(env, db, request);
+      }
+      if (url.pathname === "/croissand-kick" && request.method === "POST") {
+        return handleCroissandKick(env, db, request);
       }
       if (url.pathname === "/trigger" && request.method === "POST") {
         return handleTrigger(env, db, request);

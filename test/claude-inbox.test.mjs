@@ -131,10 +131,10 @@ async function inboxStatus(bodyObj, key = TRIGGER_KEY) {
   return { status: res.status, json: await res.json() };
 }
 
-async function rpc(payload, token) {
+async function rpc(payload, token, worker = mf) {
   const headers = { "Content-Type": "application/json" };
   if (token) headers.Authorization = "Bearer " + token;
-  const res = await mf.dispatchFetch(ORIGIN + "/mcp", {
+  const res = await worker.dispatchFetch(ORIGIN + "/mcp", {
     method: "POST",
     headers,
     body: JSON.stringify(payload),
@@ -295,4 +295,177 @@ test("tools/list includes kick_claude", async () => {
   const r = await rpc({ jsonrpc: "2.0", id: 4, method: "tools/list", params: {} }, token);
   const names = r.json.result.tools.map((t) => t.name);
   assert.ok(names.includes("kick_claude"));
+});
+
+test("Croissand reply is owner-scoped, immutable, default-off, and absent from Muse inbox", async (t) => {
+  const CROISSAND_KEY = "whsec_" + randomBytes(32).toString("base64");
+  const CONSUMER_KEY = "whsec_" + randomBytes(32).toString("base64");
+  const activation = new Date(Date.now() - 20 * 60_000).toISOString();
+  const local = new Miniflare({
+    modules: true,
+    scriptPath: new URL("../worker.js", import.meta.url).pathname,
+    compatibilityDate: "2025-11-01",
+    durableObjects: { STORE: "Store" },
+    bindings: {
+      TRIGGER_KEY, CLAUDE_HOOK_SECRET: HOOK_SECRET, IDP_ISSUER: ISSUER,
+      RESOURCE_URI: RESOURCE, OWNER_SUB: "user-1",
+      CROISSAND_REPLY_ENABLED: "1", CROISSAND_REPLY_NOT_BEFORE: activation,
+      CROISSAND_HOOK_SECRET: CROISSAND_KEY, CROISSAND_CONSUMER_ENABLED: "1",
+      CROISSAND_CONSUMER_SECRET: CONSUMER_KEY,
+    },
+    outboundService,
+  });
+  t.after(() => local.dispose());
+  await local.ready;
+  const text = "Synthetic progress only";
+  const original = { request_id: "source-record-1", text: "Status please", created_at: new Date().toISOString() };
+  const call = (name, args, worker = local, accessToken = mintJwt()) =>
+    rpc({ jsonrpc: "2.0", method: "tools/call", id: 1, params: { name, arguments: args } }, accessToken, worker);
+  async function signed(data, worker = local, secret = CROISSAND_KEY, endpoint = "/croissand-kick") {
+    const body = JSON.stringify(data);
+    const ts = String(Math.floor(Date.now() / 1000));
+    const msgId = "example-verified";
+    const res = await worker.dispatchFetch(ORIGIN + endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json", "webhook-id": msgId,
+        "webhook-timestamp": ts, "webhook-signature": signHook(secret, msgId, ts, endpoint === "/croissand-reply" ? endpoint + "\n" + body : body),
+      },
+      body,
+    });
+    return [res.status, await res.json()];
+  }
+  assert.equal((await signed(original, mf))[0], 404);
+  const listed = await rpc({ jsonrpc: "2.0", method: "tools/list", id: 1 }, mintJwt());
+  assert(!listed.json.result.tools.some(({ name }) => name.includes("croissand")));
+  assert.equal((await signed(original, local, HOOK_SECRET))[0], 401);
+  assert.equal((await signed({ ...original, created_at: "2000-01-01T00:00:00.000Z" }))[0], 400);
+  assert.equal((await signed({ ...original, request_id: undefined }))[0], 400);
+
+  const [accepted, repeated] = await Promise.all([signed(original), signed(original)]);
+  assert.equal(accepted[0], 200);
+  assert.equal(repeated[0], 200);
+  assert.equal(accepted[1].request_id, repeated[1].request_id);
+  assert.equal([accepted, repeated].filter(([, row]) => row.deduplicated).length, 1);
+  const request_id = accepted[1].request_id;
+  assert.equal((await signed({ ...original, text: "conflict" }))[0], 409);
+  const legacy = await local.dispatchFetch(ORIGIN + "/trigger", {
+    method: "POST",
+    headers: { Authorization: "Bearer " + TRIGGER_KEY },
+    body: JSON.stringify({ request_id, text: "unverified" }),
+  });
+  assert.equal(legacy.status, 400);
+  assert.equal(toolJson(await call("queue_croissand_reply", { request_id: original.request_id, text })).error, "ineligible_request");
+  assert.equal(toolJson(await call("read_croissand_reply_receipt", { request_id })).error, "reply_not_found");
+  assert.equal((await call("queue_croissand_reply", { request_id, text }, local, mintJwt({ sub: "another-user" }))).status, 403);
+  assert.equal((await call("queue_croissand_reply", { request_id, text }, local, mintJwt({ scope: "requests:read" }))).status, 403);
+  assert.equal(toolJson(await call("queue_croissand_reply", { request_id, text, recipient: "other" })).error, "invalid_reply");
+
+  const write = () => call("queue_croissand_reply", { request_id, text }).then(toolJson);
+  const replies = await Promise.all(Array.from({ length: 5 }, write));
+  assert.equal(replies[0].status, "accepted");
+  assert.equal(replies[0].delivered, false);
+  assert.equal(replies[0].recipient_acknowledged, false);
+  for (const row of replies) assert.deepEqual(row, replies[0]);
+  const lookup = async () => toolJson(await call("read_croissand_reply_receipt", { request_id }));
+  assert.deepEqual(await lookup(), replies[0]);
+  assert.equal(toolJson(await call("queue_croissand_reply", { request_id, text: "altered" })).error, "conflicting_reply");
+  assert.deepEqual(await lookup(), replies[0]);
+
+  // Even a legacy signed hook choosing the same visible reply ID can only
+  // file or update its own row. It cannot reserve the isolated reply row.
+  assert.equal((await signed({ request_id: replies[0].reply_id, text: "legacy" }, local, HOOK_SECRET, "/claude-hook"))[0], 200);
+  const legacyList = await local.dispatchFetch(ORIGIN + "/claude-inbox", {
+    headers: { Authorization: "Bearer " + TRIGGER_KEY },
+  });
+  const rows = (await legacyList.json()).requests;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].text, "legacy");
+  assert.deepEqual(await lookup(), replies[0]);
+
+  const [status, another] = await signed({ ...original, request_id: "source-record-2" });
+  assert.equal(status, 200);
+  const next = toolJson(await call("queue_croissand_reply", { request_id: another.request_id, text }));
+  assert.equal(next.status, "accepted");
+  assert.notEqual(next.reply_id, replies[0].reply_id);
+
+  const recipient = (data, key = CONSUMER_KEY, worker = local) =>
+    signed(data, worker, key, "/croissand-reply");
+  const fetchReply = { operation: "fetch", source_request_id: original.request_id };
+  assert.equal((await recipient(fetchReply, CONSUMER_KEY, mf))[0], 404);
+  for (const key of [CROISSAND_KEY, HOOK_SECRET]) assert.equal((await recipient(fetchReply, key))[0], 401);
+  assert.equal((await recipient({ ...fetchReply, source_request_id: request_id }))[0], 404);
+  const [fetchedStatus, fetched] = await recipient(fetchReply);
+  assert.equal(fetchedStatus, 200);
+  assert.equal(fetched.text, text);
+  assert.equal(fetched.reply_id, replies[0].reply_id);
+  assert.equal(fetched.delivered, false);
+  assert.deepEqual(await lookup(), replies[0]);
+  const ack = {
+    operation: "ack", source_request_id: original.request_id, reply_id: fetched.reply_id, ack_token: fetched.ack_token,
+  };
+  assert.equal((await recipient(ack, CROISSAND_KEY))[0], 401);
+  assert.equal((await recipient({ ...ack, ack_token: "wrong" }))[0], 409);
+  assert.equal((await recipient({ ...ack, source_request_id: "source-record-2", reply_id: next.reply_id }))[0], 409);
+  const acks = await Promise.all(Array.from({ length: 5 }, () => recipient(ack)));
+  for (const [ackStatus, receipt] of acks) {
+    assert.equal(ackStatus, 200);
+    assert.deepEqual(receipt, acks[0][1]);
+  }
+  const receipt = await lookup();
+  assert.deepEqual(receipt, acks[0][1]);
+  assert.equal(receipt.status, "recipient_acknowledged");
+  assert.equal(receipt.delivered, true);
+  assert.equal(receipt.recipient_acknowledged, true);
+  assert.deepEqual((await recipient(fetchReply))[1], receipt);
+  assert(!Object.hasOwn(receipt, "ack_token"));
+  assert(!Object.hasOwn(receipt, "text"));
+
+  // Advance the effective age of fixture rows without waiting 15 minutes.
+  // Only the test has access to the private Durable Object storage routes.
+  const namespace = await local.getDurableObjectNamespace("STORE");
+  const stub = namespace.get(namespace.idFromName("global"));
+  const fixtureTime = new Date(Date.now() - 16 * 60_000).toISOString();
+  const ageFixture = async (requestId) => {
+    const key = "req:" + requestId;
+    const get = await stub.fetch("https://store/get?key=" + encodeURIComponent(key));
+    const row = JSON.parse(await get.text());
+    const put = await stub.fetch("https://store/put", {
+      method: "POST",
+      body: JSON.stringify({ key, value: JSON.stringify({
+        ...row, createdAt: fixtureTime, sourceCreatedAt: fixtureTime,
+      }) }),
+    });
+    assert.equal(put.ok, true);
+  };
+  const ageReply = async (replyId) => {
+    const key = "verified-reply:" + replyId;
+    const get = await stub.fetch("https://store/get?key=" + encodeURIComponent(key));
+    const row = JSON.parse(await get.text());
+    const put = await stub.fetch("https://store/put", {
+      method: "POST",
+      body: JSON.stringify({ key, value: JSON.stringify({ ...row, acceptedAt: fixtureTime }) }),
+    });
+    assert.equal(put.ok, true);
+  };
+  const fetchSecond = { operation: "fetch", source_request_id: "source-record-2" };
+  const unacked = (await recipient(fetchSecond))[1];
+  assert.equal(unacked.reply_id, next.reply_id);
+  await ageReply(next.reply_id);
+  assert.equal((await recipient(fetchSecond))[0], 410);
+  assert.equal((await recipient({
+    ...fetchSecond, operation: "ack", reply_id: next.reply_id, ack_token: unacked.ack_token,
+  }))[0], 410);
+  assert.equal(toolJson(await call("read_croissand_reply_receipt", {
+    request_id: another.request_id,
+  })).recipient_acknowledged, false);
+  await ageReply(fetched.reply_id);
+  assert.equal((await recipient(ack))[1].acknowledged_at, receipt.acknowledged_at);
+  await ageFixture(request_id);
+  assert.equal((await write()).error, "expired_request");
+  assert.equal((await lookup()).acknowledged_at, receipt.acknowledged_at);
+  const [, stale] = await signed({ ...original, request_id: "source-record-3" });
+  await ageFixture(stale.request_id);
+  assert.equal(toolJson(await call("queue_croissand_reply", { request_id: stale.request_id, text })).error, "expired_request");
+  assert.equal(toolJson(await call("read_croissand_reply_receipt", { request_id: stale.request_id })).error, "reply_not_found");
 });
